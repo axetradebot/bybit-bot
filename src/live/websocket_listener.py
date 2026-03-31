@@ -1,0 +1,559 @@
+"""
+Connects to Bybit WebSocket and maintains a rolling window of the last
+200 5m bars in memory for each symbol.
+
+On each closed 5m bar
+  1. Writes the new candle to candles_5m
+  2. Computes indicators for the new bar (recompute on the 200-bar buffer)
+  3. Writes indicators to indicators_5m (and indicators_15m when applicable)
+  4. Calls each active strategy's generate_signal()
+  5. Passes any non-None signal to RiskManager.evaluate()
+  6. Passes approved signals to OrderManager.execute()
+
+Usage
+-----
+    python src/live/websocket_listener.py
+"""
+
+from __future__ import annotations
+
+import sys
+import threading
+import time
+from collections import deque
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import pandas_ta as ta  # noqa: F401 — registers .ta accessor
+import structlog
+from sqlalchemy import create_engine
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+project_root = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(project_root))
+
+from src.config import settings  # noqa: E402
+from src.db.models import Candles5m, Indicators5m, Indicators15m  # noqa: E402
+from src.indicators.compute_all import (  # noqa: E402
+    TA_COL_MAP,
+    DERIVED_FLOAT_COLS,
+    compute_derived,
+    compute_ta_indicators,
+)
+from src.indicators.resample import resample_5m_to_15m  # noqa: E402
+from src.live.order_manager import OrderManager  # noqa: E402
+from src.risk.risk_manager import RiskManager  # noqa: E402
+from src.strategies import STRATEGY_REGISTRY  # noqa: E402
+from src.strategies.base import BaseStrategy, _sf  # noqa: E402
+
+log = structlog.get_logger()
+
+# Minimum buffer length before we start running indicators / strategies
+_MIN_BUFFER = 20
+
+
+# -----------------------------------------------------------------------
+# Shared bot state — read by the health API, written by the listener
+# -----------------------------------------------------------------------
+
+class BotState:
+    """Thread-safe shared state for the health API."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.running: bool = False
+        self.start_time: datetime | None = None
+        self.symbols: list[str] = []
+        self.ws_connected: bool = False
+        self.last_bar: dict[str, str] = {}
+        self.blocked_signals: list[dict] = []
+
+    def update_last_bar(self, symbol: str, ts: datetime) -> None:
+        with self._lock:
+            self.last_bar[symbol] = ts.isoformat()
+
+    def add_blocked(self, info: dict) -> None:
+        with self._lock:
+            self.blocked_signals.append(info)
+            if len(self.blocked_signals) > 200:
+                self.blocked_signals = self.blocked_signals[-200:]
+
+
+# -----------------------------------------------------------------------
+# WebSocket Listener
+# -----------------------------------------------------------------------
+
+class WebSocketListener:
+    """
+    Core live-trading engine.  Subscribes to Bybit WebSocket streams,
+    processes closed 5m bars, and drives the strategy → risk → order
+    pipeline.
+    """
+
+    def __init__(self, engine: Any, state: BotState) -> None:
+        self._engine = engine
+        self.state = state
+
+        self._bar_buffer: dict[str, deque] = {}
+        self._latest_funding: dict[str, float] = {}
+        self._predicted_funding: dict[str, float] = {}
+        self._latest_mark: dict[str, float] = {}
+        self._latest_15m: dict[str, pd.Series] = {}
+
+        self._strategies: list[BaseStrategy] = []
+        for name, cls in STRATEGY_REGISTRY.items():
+            try:
+                if name == "regime_adaptive":
+                    self._strategies.append(cls(engine=engine))
+                else:
+                    self._strategies.append(cls())
+            except Exception as exc:
+                log.warning("strategy_init_failed",
+                            strategy=name, error=str(exc))
+
+        self.risk_manager = RiskManager(is_backtest=False)
+        self.order_manager = OrderManager(engine)
+        self._equity = 10_000.0
+
+        log.info("listener_initialized",
+                 strategies=[s.name for s in self._strategies],
+                 symbols=settings.symbols)
+
+    # ----- public -------------------------------------------------------
+
+    def start(self) -> None:
+        """Connect WebSocket streams and begin processing."""
+        self.state.running = True
+        self.state.start_time = datetime.now(timezone.utc)
+        self.state.symbols = list(settings.symbols)
+
+        for symbol in settings.symbols:
+            self._bar_buffer[symbol] = deque(maxlen=200)
+            self._init_buffer(symbol)
+
+        self._connect_ws()
+
+    # ----- initialisation -----------------------------------------------
+
+    def _init_buffer(self, symbol: str) -> None:
+        """Pre-fill bar buffer from the database."""
+        try:
+            df = pd.read_sql(
+                "SELECT * FROM candles_5m WHERE symbol = %(symbol)s "
+                "ORDER BY timestamp DESC LIMIT 200",
+                self._engine,
+                params={"symbol": symbol},
+                parse_dates=["timestamp"],
+            )
+            if not df.empty:
+                for _, row in df.sort_values("timestamp").iterrows():
+                    self._bar_buffer[symbol].append(row.to_dict())
+                log.info("buffer_initialized",
+                         symbol=symbol, bars=len(df))
+            else:
+                log.info("buffer_empty", symbol=symbol)
+        except Exception as exc:
+            log.warning("buffer_init_failed",
+                        symbol=symbol, error=str(exc))
+
+    def _connect_ws(self) -> None:
+        """Connect public and (optionally) private WebSocket streams."""
+        from pybit.unified_trading import WebSocket
+
+        max_retries = 10
+        for attempt in range(1, max_retries + 1):
+            try:
+                ws_kwargs = {
+                    "testnet": settings.bybit_testnet,
+                    "channel_type": "linear",
+                }
+                if settings.bybit_demo:
+                    ws_kwargs["testnet"] = False
+                    ws_kwargs["demo"] = True
+
+                self._ws_public = WebSocket(**ws_kwargs)
+                for symbol in settings.symbols:
+                    self._ws_public.kline_stream(
+                        interval=5,
+                        symbol=symbol,
+                        callback=self._on_kline,
+                    )
+                    self._ws_public.ticker_stream(
+                        symbol=symbol,
+                        callback=self._on_ticker,
+                    )
+                self.state.ws_connected = True
+                log.info("ws_public_connected",
+                         symbols=settings.symbols, attempt=attempt)
+                break
+            except Exception as exc:
+                wait = min(2 ** attempt, 60)
+                log.warning("ws_connect_retry",
+                            attempt=attempt, wait=wait, error=str(exc))
+                time.sleep(wait)
+        else:
+            log.error("ws_connect_failed_all_retries")
+            return
+
+        if settings.bybit_api_key and settings.bybit_api_secret:
+            try:
+                priv_kwargs = {
+                    "testnet": settings.bybit_testnet,
+                    "channel_type": "private",
+                    "api_key": settings.bybit_api_key,
+                    "api_secret": settings.bybit_api_secret,
+                }
+                if settings.bybit_demo:
+                    priv_kwargs["testnet"] = False
+                    priv_kwargs["demo"] = True
+
+                self._ws_private = WebSocket(**priv_kwargs)
+                self._ws_private.execution_stream(
+                    callback=self._on_execution,
+                )
+                log.info("ws_private_connected")
+            except Exception as exc:
+                log.warning("ws_private_failed", error=str(exc))
+        else:
+            log.warning("ws_private_skipped",
+                        reason="API keys not configured")
+
+    # ----- WebSocket callbacks ------------------------------------------
+
+    def _on_kline(self, message: dict) -> None:
+        try:
+            topic = message.get("topic", "")
+            parts = topic.split(".")
+            symbol = parts[2] if len(parts) >= 3 else ""
+
+            for bar_data in message.get("data", []):
+                if not bar_data.get("confirm"):
+                    continue
+
+                bar = {
+                    "symbol": symbol,
+                    "timestamp": datetime.fromtimestamp(
+                        bar_data["start"] / 1000, tz=timezone.utc,
+                    ),
+                    "open": float(bar_data["open"]),
+                    "high": float(bar_data["high"]),
+                    "low": float(bar_data["low"]),
+                    "close": float(bar_data["close"]),
+                    "volume": float(bar_data["volume"]),
+                    "buy_volume": None,
+                    "sell_volume": None,
+                    "volume_delta": None,
+                    "quote_volume": float(
+                        bar_data.get("turnover", 0) or 0
+                    ),
+                    "mark_price": self._latest_mark.get(symbol),
+                    "funding_rate": None,
+                    "trade_count": None,
+                }
+
+                self._process_closed_bar(symbol, bar)
+        except Exception as exc:
+            log.error("kline_handler_error", error=str(exc))
+
+    def _on_ticker(self, message: dict) -> None:
+        try:
+            data = message.get("data", {})
+            symbol = data.get("symbol", "")
+            fr = data.get("fundingRate")
+            if fr:
+                self._latest_funding[symbol] = float(fr)
+            mp = data.get("markPrice")
+            if mp:
+                self._latest_mark[symbol] = float(mp)
+        except Exception as exc:
+            log.error("ticker_handler_error", error=str(exc))
+
+    def _on_execution(self, message: dict) -> None:
+        try:
+            for fill in message.get("data", []):
+                self.order_manager.handle_fill(fill)
+        except Exception as exc:
+            log.error("execution_handler_error", error=str(exc))
+
+    # ----- bar processing pipeline --------------------------------------
+
+    def _process_closed_bar(self, symbol: str, bar: dict) -> None:
+        """End-to-end processing of a single confirmed 5m bar."""
+        try:
+            self._bar_buffer[symbol].append(bar)
+            self._write_candle(bar)
+
+            buf_len = len(self._bar_buffer[symbol])
+            if buf_len < _MIN_BUFFER:
+                log.info("buffer_warming",
+                         symbol=symbol, bars=buf_len,
+                         need=_MIN_BUFFER)
+                return
+
+            ind_5m, ind_15m = self._compute_indicators(symbol)
+            if ind_5m is None:
+                return
+
+            self._write_indicator_row(symbol, ind_5m, Indicators5m)
+            if ind_15m is not None:
+                self._write_indicator_row(symbol, ind_15m, Indicators15m)
+
+            self.state.update_last_bar(symbol, bar["timestamp"])
+
+            log.info("bar_processed",
+                     symbol=symbol,
+                     ts=bar["timestamp"].isoformat(),
+                     close=bar["close"])
+
+            self._run_strategies(symbol, ind_5m, ind_15m)
+
+        except Exception as exc:
+            log.error("bar_processing_error",
+                      symbol=symbol, error=str(exc), exc_info=True)
+
+    # ----- indicator computation ----------------------------------------
+
+    def _compute_indicators(
+        self, symbol: str,
+    ) -> tuple[pd.Series | None, pd.Series | None]:
+        """
+        Compute 5m (and 15m) indicators on the full bar buffer.
+        Returns (indicators_5m_row, indicators_15m_row_or_None).
+        """
+        bars = list(self._bar_buffer[symbol])
+        df = pd.DataFrame(bars)
+
+        df_ta = compute_ta_indicators(df.copy())
+        df_ta = compute_derived(df_ta)
+
+        ind_5m = df_ta.iloc[-1].copy()
+        funding = self._latest_funding.get(symbol, 0.0)
+        ind_5m["funding_8h"] = funding
+        ind_5m["funding_24h_cum"] = funding * 3
+        ind_5m["liq_volume_1h"] = 0.0
+
+        ind_15m: pd.Series | None = None
+        try:
+            df_15m = resample_5m_to_15m(df)
+            if not df_15m.empty and len(df_15m) >= 10:
+                df_15m_ta = compute_ta_indicators(df_15m.copy())
+                df_15m_ta = compute_derived(df_15m_ta)
+                ind_15m = df_15m_ta.iloc[-1].copy()
+                self._latest_15m[symbol] = ind_15m
+        except Exception as exc:
+            log.warning("15m_error", symbol=symbol, error=str(exc))
+
+        if ind_15m is None:
+            ind_15m = self._latest_15m.get(symbol)
+
+        return ind_5m, ind_15m
+
+    # ----- DB writes ----------------------------------------------------
+
+    def _write_candle(self, bar: dict) -> None:
+        try:
+            record = {k: v for k, v in bar.items()}
+            table = Candles5m.__table__
+            pk = [c.name for c in table.primary_key.columns]
+            upd = [c.name for c in table.columns if c.name not in pk]
+            stmt = pg_insert(table).values([record])
+            stmt = stmt.on_conflict_do_update(
+                index_elements=pk,
+                set_={c: stmt.excluded[c] for c in upd},
+            )
+            with self._engine.begin() as conn:
+                conn.execute(stmt)
+        except Exception as exc:
+            log.error("candle_write_error", error=str(exc))
+
+    def _write_indicator_row(
+        self, symbol: str, row: pd.Series, model: type,
+    ) -> None:
+        try:
+            rec: dict = {
+                "symbol": symbol,
+                "timestamp": row.get("timestamp"),
+            }
+            for ta_col, db_col in TA_COL_MAP.items():
+                val = row.get(ta_col)
+                val = self._safe(val)
+                if db_col == "supertrend_dir":
+                    rec[db_col] = int(val) if val is not None else None
+                else:
+                    rec[db_col] = val
+            for col in DERIVED_FLOAT_COLS:
+                rec[col] = self._safe(row.get(col))
+            rec["bb_squeeze"] = self._safe_bool(row.get("bb_squeeze"))
+            rec["extras"] = {}
+
+            table = model.__table__
+            pk = [c.name for c in table.primary_key.columns]
+            upd = [c.name for c in table.columns if c.name not in pk]
+            stmt = pg_insert(table).values([rec])
+            stmt = stmt.on_conflict_do_update(
+                index_elements=pk,
+                set_={c: stmt.excluded[c] for c in upd},
+            )
+            with self._engine.begin() as conn:
+                conn.execute(stmt)
+        except Exception as exc:
+            log.error("indicator_write_error", error=str(exc))
+
+    @staticmethod
+    def _safe(val: Any) -> float | None:
+        if val is None:
+            return None
+        try:
+            if pd.isna(val):
+                return None
+        except (TypeError, ValueError):
+            pass
+        return float(val)
+
+    @staticmethod
+    def _safe_bool(val: Any) -> bool | None:
+        if val is None:
+            return None
+        try:
+            if pd.isna(val):
+                return None
+        except (TypeError, ValueError):
+            pass
+        return bool(val)
+
+    # ----- strategy pipeline --------------------------------------------
+
+    def _run_strategies(
+        self,
+        symbol: str,
+        ind_5m: pd.Series,
+        ind_15m: pd.Series | None,
+    ) -> None:
+        funding = self._latest_funding.get(symbol, 0.0)
+        liq_vol = _sf(ind_5m.get("liq_volume_1h"))
+        empty_15m = pd.Series(dtype=object)
+
+        for strategy in self._strategies:
+            try:
+                signal = strategy.generate_signal(
+                    symbol=symbol,
+                    indicators_5m=ind_5m,
+                    indicators_15m=(
+                        ind_15m if ind_15m is not None else empty_15m
+                    ),
+                    funding_rate=funding,
+                    liq_volume_1h=liq_vol,
+                )
+
+                if signal is None or signal.direction == "flat":
+                    continue
+
+                positions = self.order_manager.sync_positions()
+                daily_pnl = self.order_manager.get_daily_pnl()
+                predicted = self._predicted_funding.get(symbol, funding)
+
+                approved = self.risk_manager.evaluate(
+                    signal=signal,
+                    account_equity=self._equity,
+                    open_positions=positions,
+                    daily_pnl_usd=daily_pnl,
+                    current_funding_rate=funding,
+                    predicted_funding_rate=predicted,
+                    session=self._engine,
+                )
+
+                if approved is None:
+                    last = (
+                        self.risk_manager._blocked[-1]
+                        if self.risk_manager._blocked
+                        else {}
+                    )
+                    self.state.add_blocked({
+                        "symbol": symbol,
+                        "strategy": strategy.name,
+                        "direction": signal.direction,
+                        "reason": last.get("exit_reason", "unknown"),
+                        "timestamp": signal.timestamp.isoformat(),
+                    })
+                    continue
+
+                self.order_manager.open_position(approved)
+
+                log.info("signal_executed",
+                         symbol=symbol,
+                         strategy=strategy.name,
+                         direction=approved.direction)
+
+            except Exception as exc:
+                log.error("strategy_error",
+                          symbol=symbol,
+                          strategy=strategy.name,
+                          error=str(exc))
+
+    # ----- manual signal injection (called from health API) -------------
+
+    def inject_signal(self, signal: SignalEvent) -> dict:
+        """Pass a manually constructed signal through RM -> OM."""
+        from src.strategies.base import SignalEvent  # noqa: F811
+
+        positions = self.order_manager.sync_positions()
+        daily_pnl = self.order_manager.get_daily_pnl()
+        funding = self._latest_funding.get(signal.symbol, 0.0)
+
+        approved = self.risk_manager.evaluate(
+            signal=signal,
+            account_equity=self._equity,
+            open_positions=positions,
+            daily_pnl_usd=daily_pnl,
+            current_funding_rate=funding,
+            predicted_funding_rate=funding,
+            session=self._engine,
+        )
+
+        if approved is None:
+            return {"status": "blocked", "reason": "risk_manager"}
+
+        order = self.order_manager.open_position(approved)
+        return {
+            "status": "executed",
+            "order_id": order["id"] if order else None,
+        }
+
+
+# -----------------------------------------------------------------------
+# Entry point
+# -----------------------------------------------------------------------
+
+def main() -> None:
+    """Start the live trading bot."""
+    import uvicorn
+    from src.api.health_api import create_health_app
+
+    engine = create_engine(settings.sync_db_url)
+    state = BotState()
+    listener = WebSocketListener(engine, state)
+
+    ws_thread = threading.Thread(target=listener.start, daemon=True)
+    ws_thread.start()
+
+    # background position-sync every 60 s
+    def _sync_loop() -> None:
+        while True:
+            try:
+                listener.order_manager.sync_positions()
+            except Exception:
+                pass
+            time.sleep(60)
+
+    threading.Thread(target=_sync_loop, daemon=True).start()
+
+    app = create_health_app(engine, state, listener)
+    log.info("starting_health_api", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=8080, log_level="info")
+
+
+if __name__ == "__main__":
+    main()

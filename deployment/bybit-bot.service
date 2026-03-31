@@ -1,0 +1,18 @@
+[Unit]
+Description=Bybit Futures Trading Bot
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/bybit_bot
+ExecStart=/opt/bybit_bot/.venv/bin/python src/live/websocket_listener.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONPATH=/opt/bybit_bot
+
+[Install]
+WantedBy=multi-user.target

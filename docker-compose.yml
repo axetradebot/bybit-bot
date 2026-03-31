@@ -1,0 +1,46 @@
+version: '3.8'
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: bybit_timescaledb
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: bybit_shadow
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+    command: >
+      postgres
+        -c shared_preload_libraries=timescaledb
+        -c max_connections=200
+        -c work_mem=256MB
+        -c maintenance_work_mem=1GB
+        -c checkpoint_completion_target=0.9
+        -c wal_buffers=64MB
+        -c effective_cache_size=4GB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d bybit_shadow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  tardis-machine:
+    image: tardisdev/tardis-machine
+    container_name: bybit_tardis_machine
+    restart: unless-stopped
+    environment:
+      TM_API_KEY: ${TARDIS_API_KEY}
+    ports:
+      - "8000:8000"
+      - "8001:8001"
+    volumes:
+      - tardis_cache:/.cache
+
+volumes:
+  timescale_data:
+    driver: local
+  tardis_cache:
+    driver: local
