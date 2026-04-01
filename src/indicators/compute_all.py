@@ -44,9 +44,9 @@ TA_COL_MAP: dict[str, str] = {
     "MACD_12_26_9": "macd_line",
     "MACDs_12_26_9": "macd_signal",
     "MACDh_12_26_9": "macd_hist",
-    "MACD_5_13_1": "macd_fast_line",
-    "MACDs_5_13_1": "macd_fast_signal",
-    "MACDh_5_13_1": "macd_fast_hist",
+    "MACD_5_13_3": "macd_fast_line",
+    "MACDs_5_13_3": "macd_fast_signal",
+    "MACDh_5_13_3": "macd_fast_hist",
     "BBU_20_2.0_2.0": "bb_upper",
     "BBM_20_2.0_2.0": "bb_mid",
     "BBL_20_2.0_2.0": "bb_lower",
@@ -92,6 +92,14 @@ def load_candles(engine, symbol: str, from_date: str | None = None) -> pd.DataFr
         params["from_date"] = from_date
     query += " ORDER BY timestamp"
     df = pd.read_sql(query, engine, params=params, parse_dates=["timestamp"])
+    numeric_cols = [
+        "open", "high", "low", "close", "volume",
+        "buy_volume", "sell_volume", "volume_delta",
+        "quote_volume", "mark_price", "funding_rate",
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     log.info("candles_loaded", symbol=symbol, rows=len(df))
     return df
 
@@ -101,8 +109,80 @@ def load_funding(engine, symbol: str) -> pd.DataFrame:
         "SELECT timestamp, funding_rate FROM funding_history "
         "WHERE symbol = %(symbol)s ORDER BY timestamp"
     )
-    return pd.read_sql(query, engine, params={"symbol": symbol},
-                       parse_dates=["timestamp"])
+    df = pd.read_sql(query, engine, params={"symbol": symbol},
+                      parse_dates=["timestamp"])
+    if "funding_rate" in df.columns:
+        df["funding_rate"] = pd.to_numeric(df["funding_rate"], errors="coerce")
+    return df
+
+
+def load_coinglass_bars(engine, symbol: str) -> pd.DataFrame:
+    """4h (or configured) aggregated long/short liq USD from CoinGlass table."""
+    iv = settings.coinglass_min_liquidation_interval
+    try:
+        df = pd.read_sql(
+            """
+            SELECT bucket_time, long_liquidation_usd, short_liquidation_usd
+            FROM coinglass_liquidation_bars
+            WHERE symbol = %(symbol)s AND interval = %(iv)s
+            ORDER BY bucket_time
+            """,
+            engine,
+            params={"symbol": symbol, "iv": iv},
+            parse_dates=["bucket_time"],
+        )
+    except Exception as exc:
+        log.warning("coinglass_table_missing_or_error", error=str(exc))
+        return pd.DataFrame()
+    for col in ("long_liquidation_usd", "short_liquidation_usd"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    log.info("coinglass_bars_loaded", symbol=symbol, rows=len(df))
+    return df
+
+
+def join_coinglass_liquidations(
+    df: pd.DataFrame, cg: pd.DataFrame,
+) -> pd.DataFrame:
+    """Forward-fill last known 4h bar onto each candle (merge_asof backward)."""
+    if cg.empty:
+        out = df.copy()
+        out["coinglass_long_liq_usd"] = np.nan
+        out["coinglass_short_liq_usd"] = np.nan
+        out["coinglass_liq_imb"] = np.nan
+        return out
+
+    left = df.sort_values("timestamp").copy()
+    right = cg.sort_values("bucket_time").rename(
+        columns={"bucket_time": "cg_bucket"},
+    )
+    merged = pd.merge_asof(
+        left,
+        right,
+        left_on="timestamp",
+        right_on="cg_bucket",
+        direction="backward",
+    )
+    merged["coinglass_long_liq_usd"] = pd.to_numeric(
+        merged["long_liquidation_usd"], errors="coerce",
+    )
+    merged["coinglass_short_liq_usd"] = pd.to_numeric(
+        merged["short_liquidation_usd"], errors="coerce",
+    )
+    tot = merged["coinglass_long_liq_usd"] + merged["coinglass_short_liq_usd"]
+    merged["coinglass_liq_imb"] = (
+        (merged["coinglass_short_liq_usd"] - merged["coinglass_long_liq_usd"])
+        / (tot + 1e-9)
+    )
+    merged = merged.drop(
+        columns=[
+            "cg_bucket",
+            "long_liquidation_usd",
+            "short_liquidation_usd",
+        ],
+        errors="ignore",
+    )
+    return merged
 
 
 def load_liquidations(engine, symbol: str) -> pd.DataFrame:
@@ -110,8 +190,11 @@ def load_liquidations(engine, symbol: str) -> pd.DataFrame:
         "SELECT timestamp, value_usd FROM liquidations "
         "WHERE symbol = %(symbol)s ORDER BY timestamp"
     )
-    return pd.read_sql(query, engine, params={"symbol": symbol},
-                       parse_dates=["timestamp"])
+    df = pd.read_sql(query, engine, params={"symbol": symbol},
+                      parse_dates=["timestamp"])
+    if "value_usd" in df.columns:
+        df["value_usd"] = pd.to_numeric(df["value_usd"], errors="coerce")
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +215,7 @@ def compute_ta_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df.ta.stochrsi(length=14, rsi_length=14, k=3, d=3, append=True)
 
     df.ta.macd(fast=12, slow=26, signal=9, append=True)
-    df.ta.macd(fast=5, slow=13, signal=1, append=True)
+    df.ta.macd(fast=5, slow=13, signal=3, append=True)
 
     df.ta.bbands(length=20, std=2.0, append=True)
 
@@ -174,11 +257,10 @@ def compute_derived(df: pd.DataFrame) -> pd.DataFrame:
     df["vwap_dev_lower2"] = vwap - (atr * 2)
 
     # Order flow imbalance (3-bar rolling avg of buy_vol / total_vol)
+    vol = df["volume"].astype(float).replace(0, np.nan)
+    buy_vol = df["buy_volume"].astype(float)
     df["order_flow_imb"] = (
-        df["buy_volume"]
-        .div(df["volume"].replace(0, pd.NA))
-        .rolling(3, min_periods=1)
-        .mean()
+        buy_vol.div(vol).rolling(3, min_periods=1).mean()
     )
 
     # Heikin Ashi
@@ -302,6 +384,18 @@ def build_records(df: pd.DataFrame, symbol: str) -> list[dict]:
         for c in DIV_COLS:
             v = row.get(c, False)
             extras[c] = bool(v) if v is not None and not (isinstance(v, float) and np.isnan(v)) else False
+        for col, key in (
+            ("coinglass_long_liq_usd", "cg_long_liq_usd"),
+            ("coinglass_short_liq_usd", "cg_short_liq_usd"),
+            ("coinglass_liq_imb", "cg_liq_imb"),
+        ):
+            v = row.get(col)
+            if v is not None:
+                try:
+                    if not (isinstance(v, float) and np.isnan(v)):
+                        extras[key] = float(v)
+                except (TypeError, ValueError):
+                    pass
         rec["extras"] = extras
 
         records.append(rec)
@@ -361,6 +455,7 @@ def run_pipeline(
 
     funding_df = load_funding(engine, symbol)
     liq_df = load_liquidations(engine, symbol)
+    cg_df = load_coinglass_bars(engine, symbol)
 
     log.info("computing_5m_indicators", symbol=symbol, candles=len(df))
     df = compute_ta_indicators(df)
@@ -368,6 +463,7 @@ def run_pipeline(
     df = detect_rsi_divergence(df)
     df = join_funding(df, funding_df)
     df = join_liquidations(df, liq_df)
+    df = join_coinglass_liquidations(df, cg_df)
 
     records_5m = build_records(df, symbol)
     write_indicators(engine, Indicators5m, records_5m, "indicators_5m")
@@ -386,6 +482,7 @@ def run_pipeline(
     df_15m = detect_rsi_divergence(df_15m)
     df_15m = join_funding(df_15m, funding_df)
     df_15m = join_liquidations(df_15m, liq_df)
+    df_15m = join_coinglass_liquidations(df_15m, cg_df)
 
     records_15m = build_records(df_15m, symbol)
     write_indicators(engine, Indicators15m, records_15m, "indicators_15m")

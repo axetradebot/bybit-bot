@@ -34,6 +34,9 @@ STRATEGY_REGISTRY: dict[str, type] = {
     "regime_adaptive": RegimeAdaptiveStrategy,
 }
 
+# Mean-reversion: post limit at signal price, maker fees. Momentum: next-bar market, taker fees.
+LIMIT_FILL_HEADS: frozenset[str] = frozenset({"vwap_reversion", "rsi_div"})
+
 
 def _sf(val) -> float:
     if val is None:
@@ -115,10 +118,19 @@ class StrategyAdapter:
         if signal is None or signal.direction == "flat":
             return None
 
+        fill_mode = signal.fill_mode
+        if fill_mode is None:
+            head = signal.strategy_combo[0] if signal.strategy_combo else ""
+            fill_mode = (
+                "limit" if head in LIMIT_FILL_HEADS else "market"
+            )
+
         return EntryOrder(
             direction=signal.direction,
             sl_distance=abs(signal.entry_price - signal.stop_loss),
             tp_distance=abs(signal.take_profit - signal.entry_price),
             strategy_combo=signal.strategy_combo,
             indicators_snapshot=signal.indicators_snapshot,
+            limit_price=float(signal.entry_price),
+            fill_mode=fill_mode,
         )

@@ -1,14 +1,17 @@
 """
-Bar-by-bar backtest simulator.
+Bar-by-bar backtest simulator with hybrid fill model.
 
-Walks 5m candles sequentially, evaluates a pluggable strategy on each bar,
-simulates realistic fills (next-bar open), and tracks funding payments.
+- Limit + maker (0.02% / side): mean-reversion (VWAP, RSI divergence).
+  Fill when price trades through limit_price; TTL = LIMIT_ORDER_TTL bars.
+- Market + taker (0.055% / side): momentum / breakouts (BB squeeze,
+  multitf scalp, volume delta). Fill at next bar's open after signal.
+- Cooldown between trades reduces overtrading.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
@@ -19,7 +22,11 @@ from sqlalchemy import create_engine
 
 log = structlog.get_logger()
 
-# All indicators_5m columns that go into the snapshot
+MAKER_FEE = 0.0002        # Bybit maker, per side
+TAKER_FEE = 0.00055       # Bybit taker, per side (VIP0)
+LIMIT_ORDER_TTL = 3       # bars before unfilled limit expires
+COOLDOWN_BARS = 6         # minimum bars between trades (30 min on 5m)
+
 INDICATOR_COLS = [
     "ema_9", "ema_21", "ema_50", "ema_200",
     "rsi_14", "stochrsi_k", "stochrsi_d",
@@ -54,6 +61,8 @@ class EntryOrder:
     tp_distance: float
     strategy_combo: list[str]
     indicators_snapshot: dict
+    limit_price: float = 0.0
+    fill_mode: str = "limit"  # "limit" | "market"
 
 
 @dataclass
@@ -71,6 +80,7 @@ class ClosedTrade:
     pnl_pct: float
     pnl_usd: float
     funding_paid_usd: float
+    fees_paid_usd: float
     win_loss: bool
     strategy_combo: list[str]
     indicators_snapshot: dict
@@ -96,6 +106,16 @@ class _OpenPosition:
     regime_time_of_day: str
     entry_bar_idx: int
     funding_paid_usd: float = 0.0
+    fees_paid_usd: float = 0.0
+    fee_rate_per_side: float = MAKER_FEE
+
+
+@dataclass
+class _PendingOrder:
+    order: EntryOrder
+    limit_price: float
+    signal_bar_idx: int
+    bars_alive: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +123,6 @@ class _OpenPosition:
 # ---------------------------------------------------------------------------
 
 def build_indicator_snapshot(bar: pd.Series) -> dict:
-    """Capture every indicator + candle column into a JSON-safe dict."""
     snap: dict = {}
     for col in INDICATOR_COLS + CANDLE_SNAPSHOT_COLS:
         val = bar.get(col)
@@ -178,61 +197,6 @@ class Strategy(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# BB Squeeze strategy
-# ---------------------------------------------------------------------------
-
-class BBSqueezeStrategy:
-    """
-    Entry:  BB squeeze releases (True -> False) with MACD histogram
-            confirming direction.
-    SL:     2 x ATR from entry.
-    TP:     3 x ATR from entry (1.5:1 R:R).
-    """
-
-    name = "bb_squeeze"
-
-    def on_bar(
-        self, bar: pd.Series, prev_bar: pd.Series | None,
-    ) -> EntryOrder | None:
-        if prev_bar is None:
-            return None
-
-        prev_squeeze = prev_bar.get("bb_squeeze")
-        curr_squeeze = bar.get("bb_squeeze")
-
-        if not (prev_squeeze == True and curr_squeeze == False):  # noqa: E712
-            return None
-
-        atr = bar.get("atr_14")
-        macd_hist = bar.get("macd_hist")
-
-        if atr is None or pd.isna(atr) or macd_hist is None or pd.isna(macd_hist):
-            return None
-
-        atr = float(atr)
-        if atr <= 0:
-            return None
-
-        if float(macd_hist) > 0:
-            direction = "long"
-        else:
-            direction = "short"
-
-        return EntryOrder(
-            direction=direction,
-            sl_distance=2.0 * atr,
-            tp_distance=3.0 * atr,
-            strategy_combo=["bb_squeeze", "macd_confirm"],
-            indicators_snapshot=build_indicator_snapshot(bar),
-        )
-
-
-STRATEGIES: dict[str, type[Strategy]] = {
-    "bb_squeeze": BBSqueezeStrategy,
-}
-
-
-# ---------------------------------------------------------------------------
 # Simulator
 # ---------------------------------------------------------------------------
 
@@ -252,8 +216,6 @@ class Simulator:
         self.risk_pct = risk_pct
         self.equity = equity
 
-    # ----- public -----------------------------------------------------------
-
     def run(
         self,
         engine,
@@ -272,42 +234,104 @@ class Simulator:
         )
 
         position: _OpenPosition | None = None
-        pending: EntryOrder | None = None
+        pending: _PendingOrder | None = None
         closed: list[ClosedTrade] = []
+        last_exit_bar: int = -COOLDOWN_BARS
+        unfilled_count: int = 0
 
         for i in range(len(bars)):
             bar = bars.iloc[i]
             prev_bar = bars.iloc[i - 1] if i > 0 else None
             bar_ts = pd.Timestamp(bar["timestamp"])
+            bar_open = float(bar["open"])
+            bar_high = float(bar["high"])
+            bar_low = float(bar["low"])
+            bar_close = float(bar["close"])
 
-            # 1. Fill pending entry at this bar's open
+            # 1. Fill pending order (limit touch or next-bar market open)
             if pending is not None and position is None:
-                position = self._fill_entry(pending, bar, i)
-                pending = None
+                pending.bars_alive += 1
+                filled = False
+                fill_price = 0.0
+                odr = pending.order
+                is_market = odr.fill_mode == "market"
 
-            # 2. Check exit (only for positions opened on a previous bar)
-            elif position is not None and position.entry_bar_idx < i:
+                if is_market:
+                    if pending.bars_alive == 1:
+                        fill_price = bar_open
+                        filled = True
+                    elif pending.bars_alive > 1:
+                        unfilled_count += 1
+                        pending = None
+                else:
+                    if odr.direction == "long":
+                        if bar_low <= pending.limit_price:
+                            fill_price = pending.limit_price
+                            filled = True
+                    else:
+                        if bar_high >= pending.limit_price:
+                            fill_price = pending.limit_price
+                            filled = True
+                    if not filled and pending.bars_alive >= LIMIT_ORDER_TTL:
+                        unfilled_count += 1
+                        pending = None
+
+                if filled and pending is not None:
+                    fee = TAKER_FEE if is_market else MAKER_FEE
+                    position = self._fill_entry(
+                        odr, fill_price, bar, i, fee,
+                    )
+                    same_bar_exit = self._check_same_bar_exit(
+                        position, bar_high, bar_low,
+                    )
+                    if same_bar_exit is not None:
+                        trade = self._close_position(
+                            position, same_bar_exit,
+                            bar_ts.to_pydatetime(), "sl",
+                        )
+                        closed.append(trade)
+                        position = None
+                        last_exit_bar = i
+                    pending = None
+
+            # 2. Check exit for existing position
+            if position is not None and position.entry_bar_idx < i:
                 trade = self._check_exit(position, bar)
                 if trade is not None:
                     closed.append(trade)
                     position = None
+                    last_exit_bar = i
 
-            # 3. Apply funding if this bar lands on a funding timestamp
+            # 3. Apply funding
             if position is not None:
                 self._apply_funding(position, bar_ts, funding_map)
 
-            # 4. Generate new entry signal
-            if position is None and pending is None:
+            # 4. Generate new signal (with cooldown)
+            if (position is None and pending is None
+                    and (i - last_exit_bar) >= COOLDOWN_BARS):
                 order = self.strategy.on_bar(bar, prev_bar)
                 if order is not None:
-                    pending = order
+                    limit_px = (
+                        order.limit_price if order.limit_price > 0 else bar_close
+                    )
+                    pending = _PendingOrder(
+                        order=order,
+                        limit_price=limit_px,
+                        signal_bar_idx=i,
+                    )
 
-        # Force-close any remaining open position at last bar's close
+        if pending is not None:
+            unfilled_count += 1
+
         if position is not None:
             trade = self._force_close(position, bars.iloc[-1])
             closed.append(trade)
 
-        log.info("simulation_complete", trades=len(closed))
+        log.info(
+            "simulation_complete",
+            trades=len(closed),
+            unfilled=unfilled_count,
+        )
         return closed
 
     # ----- data loading -----------------------------------------------------
@@ -320,7 +344,8 @@ class Simulator:
             "  AND timestamp < %(to_date)s "
             "ORDER BY timestamp",
             engine,
-            params={"symbol": self.symbol, "from_date": from_date, "to_date": to_date},
+            params={"symbol": self.symbol, "from_date": from_date,
+                    "to_date": to_date},
             parse_dates=["timestamp"],
         )
         indicators = pd.read_sql(
@@ -330,7 +355,8 @@ class Simulator:
             "  AND timestamp < %(to_date)s "
             "ORDER BY timestamp",
             engine,
-            params={"symbol": self.symbol, "from_date": from_date, "to_date": to_date},
+            params={"symbol": self.symbol, "from_date": from_date,
+                    "to_date": to_date},
             parse_dates=["timestamp"],
         )
         merged = candles.merge(
@@ -339,6 +365,11 @@ class Simulator:
             how="inner",
             suffixes=("", "_ind"),
         )
+        numeric_cols = ["open", "high", "low", "close", "volume",
+                        "buy_volume", "sell_volume"]
+        for col in numeric_cols:
+            if col in merged.columns:
+                merged[col] = pd.to_numeric(merged[col], errors="coerce")
         log.info("bars_loaded", rows=len(merged))
         return merged
 
@@ -353,44 +384,59 @@ class Simulator:
         return {pd.Timestamp(row["timestamp"]): float(row["funding_rate"])
                 for _, row in df.iterrows()}
 
-    # ----- fill / exit logic ------------------------------------------------
+    # ----- fill logic -------------------------------------------------------
 
     def _fill_entry(
-        self, order: EntryOrder, bar: pd.Series, bar_idx: int,
+        self,
+        order: EntryOrder,
+        fill_price: float,
+        bar: pd.Series,
+        bar_idx: int,
+        fee_rate: float,
     ) -> _OpenPosition:
-        entry_price = float(bar["open"])
-
         if order.direction == "long":
-            sl = entry_price - order.sl_distance
-            tp = entry_price + order.tp_distance
+            sl = fill_price - order.sl_distance
+            tp = fill_price + order.tp_distance
         else:
-            sl = entry_price + order.sl_distance
-            tp = entry_price - order.tp_distance
+            sl = fill_price + order.sl_distance
+            tp = fill_price - order.tp_distance
 
-        sl_pct = order.sl_distance / entry_price
+        sl_pct = order.sl_distance / fill_price if fill_price > 0 else 0.01
         risk_amount = self.equity * self.risk_pct
         position_size_usd = risk_amount / sl_pct if sl_pct > 0 else risk_amount
+        position_size_usd = min(position_size_usd, self.equity * self.leverage)
 
+        entry_fee = position_size_usd * fee_rate
         bar_ts = pd.Timestamp(bar["timestamp"])
 
         return _OpenPosition(
             direction=order.direction,
             entry_time=bar_ts.to_pydatetime(),
-            entry_price=entry_price,
+            entry_price=fill_price,
             stop_loss=sl,
             take_profit=tp,
             position_size_usd=position_size_usd,
             strategy_combo=order.strategy_combo,
             indicators_snapshot=order.indicators_snapshot,
             regime_volatility=classify_volatility(
-                pd.Series(order.indicators_snapshot)
-            ),
+                pd.Series(order.indicators_snapshot)),
             regime_funding=classify_funding(
-                pd.Series(order.indicators_snapshot)
-            ),
+                pd.Series(order.indicators_snapshot)),
             regime_time_of_day=classify_time_of_day(bar_ts.to_pydatetime()),
             entry_bar_idx=bar_idx,
+            fees_paid_usd=entry_fee,
+            fee_rate_per_side=fee_rate,
         )
+
+    def _check_same_bar_exit(
+        self, pos: _OpenPosition, bar_high: float, bar_low: float,
+    ) -> float | None:
+        """Return SL price if stop is hit on the fill bar."""
+        if pos.direction == "long" and bar_low <= pos.stop_loss:
+            return pos.stop_loss
+        if pos.direction == "short" and bar_high >= pos.stop_loss:
+            return pos.stop_loss
+        return None
 
     def _check_exit(
         self, pos: _OpenPosition, bar: pd.Series,
@@ -398,9 +444,6 @@ class Simulator:
         low = float(bar["low"])
         high = float(bar["high"])
         bar_ts = pd.Timestamp(bar["timestamp"]).to_pydatetime()
-
-        sl_hit = False
-        tp_hit = False
 
         if pos.direction == "long":
             sl_hit = low <= pos.stop_loss
@@ -412,8 +455,10 @@ class Simulator:
         if not sl_hit and not tp_hit:
             return None
 
-        # Conservative: if both trigger on same bar, assume SL hit
-        if sl_hit:
+        if sl_hit and tp_hit:
+            exit_price = pos.stop_loss
+            exit_reason = "sl"
+        elif sl_hit:
             exit_price = pos.stop_loss
             exit_reason = "sl"
         else:
@@ -441,8 +486,14 @@ class Simulator:
         else:
             raw_pct = (pos.entry_price - exit_price) / pos.entry_price
 
-        pnl_usd = pos.position_size_usd * raw_pct - pos.funding_paid_usd
-        pnl_pct = raw_pct
+        exit_fee = pos.position_size_usd * pos.fee_rate_per_side
+        total_fees = pos.fees_paid_usd + exit_fee
+
+        pnl_usd = (pos.position_size_usd * raw_pct
+                    - pos.funding_paid_usd - total_fees)
+        pnl_pct = pnl_usd / pos.position_size_usd if pos.position_size_usd > 0 else 0.0
+
+        self.equity += pnl_usd
 
         return ClosedTrade(
             symbol=self.symbol,
@@ -458,6 +509,7 @@ class Simulator:
             pnl_pct=pnl_pct,
             pnl_usd=pnl_usd,
             funding_paid_usd=pos.funding_paid_usd,
+            fees_paid_usd=total_fees,
             win_loss=pnl_usd > 0,
             strategy_combo=pos.strategy_combo,
             indicators_snapshot=pos.indicators_snapshot,
@@ -466,8 +518,6 @@ class Simulator:
             regime_time_of_day=pos.regime_time_of_day,
             exit_reason=exit_reason,
         )
-
-    # ----- funding ----------------------------------------------------------
 
     def _apply_funding(
         self,

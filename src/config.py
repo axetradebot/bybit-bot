@@ -21,6 +21,27 @@ class Settings(BaseSettings):
     bybit_testnet: bool = Field(True, env="BYBIT_TESTNET")
     bybit_demo: bool = Field(False, env="BYBIT_DEMO")
 
+    # Optional: CoinGlass Crypto API (see src/data/coinglass_liquidation.py)
+    coinglass_api_key: str = Field("", env="COINGLASS_API_KEY")
+    coinglass_base_url: str = Field(
+        "https://open-api-v4.coinglass.com",
+        env="COINGLASS_BASE_URL",
+    )
+    # Hobbyist ~30 RPM; stay slightly under to avoid 429
+    coinglass_max_requests_per_minute: int = Field(28, env="COINGLASS_MAX_RPM")
+    # Aggregated liquidation history: Hobbyist requires interval >= 4h
+    coinglass_min_liquidation_interval: str = Field("4h", env="COINGLASS_MIN_INTERVAL")
+    coinglass_exchange_list: str = Field(
+        "Binance,Bybit,OKX",
+        env="COINGLASS_EXCHANGE_LIST",
+    )
+    coinglass_enforce_hobbyist_limits: bool = Field(
+        True,
+        env="COINGLASS_ENFORCE_HOBBYIST_LIMITS",
+    )
+    # Max bars per symbol per sync (API max 1000; keep moderate for Hobbyist RPM)
+    coinglass_sync_history_limit: int = Field(240, env="COINGLASS_SYNC_LIMIT")
+
     @property
     def is_paper_trading(self) -> bool:
         """True when using testnet OR demo — no real money at risk."""

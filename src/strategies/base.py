@@ -61,6 +61,8 @@ class SignalEvent(BaseModel):
     regime: dict
     timestamp: datetime
     timeframe: str = "5m"
+    # Backtest / execution hint: limit+maker for mean-reversion, market+taker for momentum
+    fill_mode: Literal["limit", "market"] | None = None
 
     model_config = {"arbitrary_types_allowed": True}
 
@@ -86,9 +88,14 @@ class BaseStrategy(ABC):
     ``generate_signal()`` is called once per closed 5m bar.
     It receives the current indicator row and must return a ``SignalEvent``
     or ``None`` if no signal conditions are met.
+
+    Subclasses can define ``blocked_regimes`` — a list of
+    ``(volatility, funding, session)`` tuples where the strategy should
+    NOT trade.  Use ``"*"`` as a wildcard for any dimension.
     """
 
     name: str = "base"
+    blocked_regimes: list[tuple[str, str, str]] = []
 
     @abstractmethod
     def generate_signal(
@@ -99,6 +106,17 @@ class BaseStrategy(ABC):
         funding_rate: float,
         liq_volume_1h: float,
     ) -> SignalEvent | None: ...
+
+    def _regime_allowed(self, regime: dict) -> bool:
+        vol = regime["volatility"]
+        fund = regime["funding"]
+        sess = regime["time_of_day"]
+        for bv, bf, bs in self.blocked_regimes:
+            if ((bv == "*" or bv == vol) and
+                (bf == "*" or bf == fund) and
+                (bs == "*" or bs == sess)):
+                return False
+        return True
 
     def _compute_regime(
         self,

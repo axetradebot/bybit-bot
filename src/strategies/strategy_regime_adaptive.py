@@ -42,14 +42,11 @@ class RegimeAdaptiveStrategy(BaseStrategy):
                 text("""
                     SELECT strategy_combo, win_rate, sharpe
                     FROM strategy_performance
-                    WHERE total_trades >= 200
-                      AND win_rate >= 0.58
-                      AND regime_funding = :fund
-                      AND last_updated >= NOW() - INTERVAL '24 hours'
-                    ORDER BY win_rate * sharpe DESC
-                    LIMIT 3
+                    WHERE total_trades >= 30
+                      AND win_rate >= 0.40
+                    ORDER BY expectancy DESC NULLS LAST
+                    LIMIT 5
                 """),
-                {"fund": fund_regime},
             ).fetchall()
         return rows
 
@@ -63,11 +60,10 @@ class RegimeAdaptiveStrategy(BaseStrategy):
     ) -> SignalEvent | None:
         self._checked_at += 1
 
-        # Refresh trade count every 500 bars to avoid constant DB hits
         if self._trade_count is None or self._checked_at % 500 == 0:
             self._trade_count = self._get_trade_count()
 
-        if self._trade_count < 500:
+        if self._trade_count < 50:
             return None
 
         atr_rank = _sf(indicators_5m.get("atr_pct_rank"))

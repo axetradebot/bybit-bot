@@ -1,7 +1,6 @@
 """
-Volume Delta + Liquidation Cluster strategy — breakout from tight
-consolidation driven by sustained aggressive order flow and liquidation
-exhaustion.
+Volume Delta + Consolidation Breakout — breakout from tight range
+with sustained order flow, volume spike, and trend alignment.
 """
 
 from __future__ import annotations
@@ -17,16 +16,28 @@ from src.strategies.base import BaseStrategy, SignalEvent, _sf, _valid
 
 class VolumeDeltaLiqStrategy(BaseStrategy):
     name = "volume_delta_liq"
+    blocked_regimes = [
+        ("low",    "negative", "*"),
+        ("low",    "positive", "asia"),
+        ("low",    "neutral",  "new_york"),
+        ("low",    "neutral",  "london"),
+        ("low",    "positive", "london"),
+        ("medium", "negative", "*"),
+        ("medium", "positive", "new_york"),
+        ("medium", "neutral",  "off_hours"),
+        ("high",   "neutral",  "new_york"),
+    ]
 
     def __init__(self):
-        self._history: deque[dict] = deque(maxlen=6)
-        self._liq_history: deque[float] = deque(maxlen=8640)
+        self._history: deque[dict] = deque(maxlen=12)
+        self._vol_history: deque[float] = deque(maxlen=288)
 
     def _snap(self, row: pd.Series) -> dict:
         return {
             "high": _sf(row.get("high")),
             "low": _sf(row.get("low")),
             "close": _sf(row.get("close")),
+            "volume": _sf(row.get("volume")),
             "volume_delta": _sf(row.get("volume_delta")),
             "order_flow_imb": _sf(row.get("order_flow_imb")),
         }
@@ -42,82 +53,84 @@ class VolumeDeltaLiqStrategy(BaseStrategy):
         c = indicators_5m
         snap = self._snap(c)
         self._history.append(snap)
-        self._liq_history.append(liq_volume_1h)
+        self._vol_history.append(snap["volume"])
 
         if len(self._history) < 6:
             return None
 
         atr = _sf(c.get("atr_14"))
         ema9 = _sf(c.get("ema_9"))
+        ema21 = _sf(c.get("ema_21"))
         ema50 = _sf(c.get("ema_50"))
 
-        if atr <= 0 or not all(_valid(c.get(k)) for k in ("atr_14", "ema_9",
-                                                            "ema_50")):
+        if atr <= 0 or not all(_valid(c.get(k)) for k in (
+                "atr_14", "ema_9", "ema_21", "ema_50")):
+            return None
+
+        atr_rank = _sf(c.get("atr_pct_rank"))
+        if atr_rank < 0.15:
             return None
 
         h = list(self._history)
         curr = h[-1]
         prev = h[-2]
 
-        # 1. Sustained aggressive flow (current AND previous bar)
-        long_flow = curr["order_flow_imb"] > 0.65 and prev["order_flow_imb"] > 0.65
-        short_flow = curr["order_flow_imb"] < 0.35 and prev["order_flow_imb"] < 0.35
+        # Aggressive flow
+        long_flow = curr["order_flow_imb"] > 0.60
+        short_flow = curr["order_flow_imb"] < 0.40
 
-        # 2. Volume delta increasing for 3 consecutive bars
+        # Volume delta: 2+ of last 3 bars in same direction, current accelerating
         vd = [bar["volume_delta"] for bar in h[-3:]]
-        long_delta = all(v > 0 for v in vd) and vd[-1] > vd[-2] > vd[-3]
-        short_delta = all(v < 0 for v in vd) and vd[-1] < vd[-2] < vd[-3]
+        long_delta = sum(1 for v in vd if v > 0) >= 2 and vd[-1] > 0
+        short_delta = sum(1 for v in vd if v < 0) >= 2 and vd[-1] < 0
 
-        # 3. Liquidation cluster — top 70th percentile of 30-day history
-        liq_pct = 0.0
-        if len(self._liq_history) >= 20:
-            arr = np.array(self._liq_history)
-            p70 = float(np.percentile(arr[arr > 0], 70)) if (arr > 0).any() else 0.0
-            liq_pct = 1.0 if liq_volume_1h >= p70 and p70 > 0 else 0.0
-        liq_ok = liq_pct >= 1.0
+        # Volume spike: 1.8x rolling mean
+        vol_spike = False
+        if len(self._vol_history) >= 30:
+            arr = np.array(self._vol_history)
+            avg_vol = float(arr.mean())
+            vol_spike = curr["volume"] > 1.8 * avg_vol if avg_vol > 0 else False
 
-        # 4. Tight consolidation: range of last 5 bars < 1.0 ATR
-        last5 = h[-5:]
-        range_high = max(b["high"] for b in last5)
-        range_low = min(b["low"] for b in last5)
-        tight = (range_high - range_low) < 1.0 * atr
+        # Tight consolidation: previous 5 bars range < 1.8 ATR
+        prev5 = h[-6:-1] if len(h) >= 6 else h[:-1]
+        if not prev5:
+            return None
+        range_high = max(b["high"] for b in prev5)
+        range_low = min(b["low"] for b in prev5)
+        tight = (range_high - range_low) < 1.8 * atr
 
-        # 5. Breakout above/below 5-bar range
         close = curr["close"]
         long_break = close > range_high
         short_break = close < range_low
 
-        # 6. Trend alignment
-        long_trend = ema9 > ema50
-        short_trend = ema9 < ema50
+        # Trend alignment
+        long_trend = ema9 > ema21 and ema9 > ema50
+        short_trend = ema9 < ema21 and ema9 < ema50
 
         direction = None
 
-        if long_flow and long_delta and liq_ok and tight and long_break and long_trend:
+        if long_flow and long_delta and vol_spike and tight and long_break and long_trend:
             direction = "long"
             sl = range_low - 0.3 * atr
-            tp = close + (close - sl) * 2.2
-        elif short_flow and short_delta and liq_ok and tight and short_break and short_trend:
+            tp = close + (close - sl) * 2.0
+        elif short_flow and short_delta and vol_spike and tight and short_break and short_trend:
             direction = "short"
             sl = range_high + 0.3 * atr
-            tp = close - (sl - close) * 2.2
+            tp = close - (sl - close) * 2.0
 
         if direction is None:
             return None
 
-        # Confidence boost for extreme liquidation
         conf = 0.60
-        if len(self._liq_history) >= 20:
-            arr = np.array(self._liq_history)
-            p90 = float(np.percentile(arr[arr > 0], 90)) if (arr > 0).any() else 0.0
-            if liq_volume_1h >= p90 > 0:
-                conf += 0.15
+        if vol_spike and abs(curr["volume_delta"]) > abs(prev["volume_delta"]):
+            conf += 0.15
         conf = min(conf, 1.0)
 
         ts = pd.Timestamp(c.get("timestamp"))
-        regime = self._compute_regime(
-            _sf(c.get("atr_pct_rank")), funding_rate, ts,
-        )
+        regime = self._compute_regime(atr_rank, funding_rate, ts)
+
+        if not self._regime_allowed(regime):
+            return None
 
         sig = SignalEvent(
             symbol=symbol,
@@ -132,5 +145,6 @@ class VolumeDeltaLiqStrategy(BaseStrategy):
                             "consolidation_break"],
             regime=regime,
             timestamp=ts,
+            fill_mode="market",
         )
-        return sig if sig.risk_reward() >= 1.5 else None
+        return sig if sig.risk_reward() >= 1.8 else None

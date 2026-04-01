@@ -1,6 +1,6 @@
 """
-VWAP Reversion strategy — mean-reversion entries when price deviates
-beyond +-1 ATR from session VWAP in low-volatility, funding-neutral conditions.
+VWAP Reversion — mean-reversion when price deviates beyond VWAP bands
+in low-volatility, funding-neutral conditions.
 """
 
 from __future__ import annotations
@@ -13,6 +13,12 @@ from src.strategies.base import BaseStrategy, SignalEvent, _sf, _valid
 
 class VWAPReversionStrategy(BaseStrategy):
     name = "vwap_reversion"
+    blocked_regimes = [
+        ("medium", "negative", "new_york"),
+        ("medium", "positive", "new_york"),
+        ("medium", "negative", "asia"),
+        ("high",   "*",        "off_hours"),
+    ]
 
     def generate_signal(
         self,
@@ -49,28 +55,31 @@ class VWAPReversionStrategy(BaseStrategy):
 
         direction = None
 
-        if (close < vwap_lo1 and rsi < 38 and atr_rank < 0.50
-                and funding_neutral and not_squeeze and ofi > 0.50):
+        if (close < vwap_lo1 and rsi < 35 and atr_rank < 0.50
+                and funding_neutral and not_squeeze and ofi > 0.52):
             direction = "long"
             sl = vwap_lo2 - 0.2 * atr
             tp = vwap
-        elif (close > vwap_hi1 and rsi > 62 and atr_rank < 0.50
-              and funding_neutral and not_squeeze and ofi < 0.50):
+        elif (close > vwap_hi1 and rsi > 65 and atr_rank < 0.50
+              and funding_neutral and not_squeeze and ofi < 0.48):
             direction = "short"
             sl = vwap_hi2 + 0.2 * atr
             tp = vwap
         else:
             return None
 
-        conf = 0.55
+        conf = 0.60
         if direction == "long" and close < vwap_lo2:
-            conf += 0.1
+            conf += 0.15
         elif direction == "short" and close > vwap_hi2:
-            conf += 0.1
+            conf += 0.15
         conf = min(conf, 1.0)
 
         ts = pd.Timestamp(c.get("timestamp"))
         regime = self._compute_regime(atr_rank, funding_rate, ts)
+
+        if not self._regime_allowed(regime):
+            return None
 
         sig = SignalEvent(
             symbol=symbol,
@@ -85,5 +94,6 @@ class VWAPReversionStrategy(BaseStrategy):
                             "funding_neutral"],
             regime=regime,
             timestamp=ts,
+            fill_mode="limit",
         )
         return sig if sig.risk_reward() >= 1.5 else None

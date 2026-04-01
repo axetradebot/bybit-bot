@@ -278,6 +278,27 @@ class TradesLog(Base):
     )
 
 
+class CoinglassLiquidationBar(Base):
+    """Aggregated long/short liquidation USD from CoinGlass API (e.g. 4h bars)."""
+
+    __tablename__ = "coinglass_liquidation_bars"
+
+    symbol: Mapped[str] = mapped_column(String(20), primary_key=True)
+    bucket_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), primary_key=True
+    )
+    interval: Mapped[str] = mapped_column(String(10), primary_key=True)
+    long_liquidation_usd: Mapped[float] = mapped_column(
+        Numeric(30, 4), nullable=False
+    )
+    short_liquidation_usd: Mapped[float] = mapped_column(
+        Numeric(30, 4), nullable=False
+    )
+    fetched_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()")
+    )
+
+
 class StrategyPerformance(Base):
     __tablename__ = "strategy_performance"
 

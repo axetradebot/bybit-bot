@@ -184,7 +184,7 @@ with tab_explorer:
                 "win_rate_pct", "avg_pnl_pct", "expectancy",
                 "sharpe", "max_dd_pct",
             ]].rename(columns={"strategy_combo_str": "strategy_combo"}),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -240,7 +240,7 @@ with tab_explorer:
                     template="plotly_dark",
                     height=380,
                 )
-                st.plotly_chart(fig_eq, use_container_width=True)
+                st.plotly_chart(fig_eq, width="stretch")
 
                 # --- win-rate heatmap by hour × day-of-week ---------------
                 df_trades["hour"] = pd.to_datetime(
@@ -279,11 +279,11 @@ with tab_explorer:
                         template="plotly_dark",
                         height=420,
                     )
-                    st.plotly_chart(fig_hm, use_container_width=True)
+                    st.plotly_chart(fig_hm, width="stretch")
 
                 # --- trade list ------------------------------------------
                 st.subheader("Trade List")
-                st.dataframe(df_trades, use_container_width=True, hide_index=True)
+                st.dataframe(df_trades, width="stretch", hide_index=True)
 
 
 # ===================================================================
@@ -342,7 +342,7 @@ with tab_regime:
                 styled = regime_df.style.map(
                     _color_wr, subset=["win_rate_pct"]
                 )
-                st.dataframe(styled, use_container_width=True, hide_index=True)
+                st.dataframe(styled, width="stretch", hide_index=True)
 
                 # Pivot: funding × volatility, averaged over sessions
                 pivot_data = regime_df.groupby(
@@ -370,7 +370,7 @@ with tab_regime:
                         template="plotly_dark",
                         height=350,
                     )
-                    st.plotly_chart(fig_rg, use_container_width=True)
+                    st.plotly_chart(fig_rg, width="stretch")
 
 
 # ===================================================================
@@ -401,7 +401,7 @@ with tab_live:
             if open_pos.empty:
                 st.caption("No open positions.")
             else:
-                st.dataframe(open_pos, use_container_width=True, hide_index=True)
+                st.dataframe(open_pos, width="stretch", hide_index=True)
         except Exception as exc:
             st.error(f"Could not load positions: {exc}")
 
@@ -436,7 +436,7 @@ with tab_live:
                     template="plotly_dark", height=280,
                     xaxis_title="Time", yaxis_title="Cum PnL (USD)",
                 )
-                st.plotly_chart(fig_pnl, use_container_width=True)
+                st.plotly_chart(fig_pnl, width="stretch")
         except Exception as exc:
             st.error(f"Could not load PnL: {exc}")
 
@@ -456,7 +456,7 @@ with tab_live:
         if signals.empty:
             st.caption("No live signals yet.")
         else:
-            st.dataframe(signals, use_container_width=True, hide_index=True)
+            st.dataframe(signals, width="stretch", hide_index=True)
     except Exception as exc:
         st.error(f"Could not load signals: {exc}")
 
@@ -474,7 +474,7 @@ with tab_live:
         if funding.empty:
             st.caption("No funding data.")
         else:
-            st.dataframe(funding, use_container_width=True, hide_index=True)
+            st.dataframe(funding, width="stretch", hide_index=True)
     except Exception as exc:
         st.error(f"Could not load funding: {exc}")
 
@@ -512,13 +512,13 @@ with tab_quality:
         except Exception:
             rows_data.append({
                 "table": tbl,
-                "rows": "N/A",
-                "earliest": "N/A",
-                "latest": "N/A",
+                "rows": 0,
+                "earliest": "-",
+                "latest": "-",
             })
     st.dataframe(
         pd.DataFrame(rows_data),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 

@@ -436,10 +436,13 @@ class RiskManagedWrapper:
         if result is None:
             return None
 
+        fill_mode = getattr(result, "fill_mode", None) or "market"
         return EntryOrder(
             direction=result.direction,
             sl_distance=abs(result.entry_price - result.stop_loss),
             tp_distance=abs(result.take_profit - result.entry_price),
             strategy_combo=result.strategy_combo,
             indicators_snapshot=result.indicators_snapshot,
+            limit_price=float(result.entry_price),
+            fill_mode=fill_mode,
         )
