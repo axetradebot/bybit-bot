@@ -57,6 +57,7 @@ from src.indicators.resample import (  # noqa: E402
     CONTEXT_TF,
 )
 from src.live.order_manager import OrderManager  # noqa: E402
+from src.live.telegram_notifier import TelegramNotifier  # noqa: E402
 from src.risk.risk_manager import RiskManager  # noqa: E402
 from src.strategies import STRATEGY_REGISTRY  # noqa: E402
 from src.strategies.base import BaseStrategy, _sf  # noqa: E402
@@ -140,6 +141,7 @@ class WebSocketListener:
         )
         self.order_manager = OrderManager(engine)
         self._equity = settings.live_equity
+        self.telegram = TelegramNotifier()
 
         log.info("listener_initialized",
                  strategies=[s.name for s in self._strategies],
@@ -161,6 +163,15 @@ class WebSocketListener:
             self._init_buffer(symbol)
 
         self._connect_ws()
+
+        self.telegram.notify_startup(
+            symbols=settings.symbols,
+            equity=self._equity,
+            risk_pct=settings.live_risk_pct,
+            strategy=settings.live_strategy,
+        )
+        exchange = self.order_manager._exchange
+        self.telegram.start_hourly_loop(exchange=exchange)
 
     # ----- initialisation -----------------------------------------------
 
@@ -301,6 +312,13 @@ class WebSocketListener:
         try:
             for fill in message.get("data", []):
                 self.order_manager.handle_fill(fill)
+                self.telegram.notify_fill(
+                    symbol=fill.get("symbol", ""),
+                    side=fill.get("side", ""),
+                    price=float(fill.get("execPrice", 0) or 0),
+                    qty=float(fill.get("execQty", 0) or 0),
+                    order_id=fill.get("orderId", ""),
+                )
         except Exception as exc:
             log.error("execution_handler_error", error=str(exc))
 
@@ -561,6 +579,12 @@ class WebSocketListener:
                  sl=signal.stop_loss,
                  tp=signal.take_profit)
 
+        self.telegram.notify_signal(
+            symbol=symbol, direction=signal.direction, tf=tf,
+            entry=signal.entry_price, sl=signal.stop_loss,
+            tp=signal.take_profit,
+        )
+
         positions = self.order_manager.sync_positions()
         daily_pnl = self.order_manager.get_daily_pnl()
         predicted = self._predicted_funding.get(symbol, funding)
@@ -581,19 +605,32 @@ class WebSocketListener:
                 if self.risk_manager._blocked
                 else {}
             )
+            reason = last.get("exit_reason", "unknown")
             self.state.add_blocked({
                 "symbol": symbol,
                 "strategy": f"sniper_{tf}",
                 "direction": signal.direction,
-                "reason": last.get("exit_reason", "unknown"),
+                "reason": reason,
                 "timestamp": signal.timestamp.isoformat(),
             })
+            self.telegram.notify_blocked(
+                symbol=symbol, strategy=f"sniper_{tf}",
+                direction=signal.direction, reason=reason,
+            )
             return
 
-        self.order_manager.open_position(approved)
+        order = self.order_manager.open_position(approved)
         log.info("sniper_executed",
                  symbol=symbol, tf=tf,
                  direction=approved.direction)
+        if order:
+            self.telegram.notify_order_placed(
+                symbol=symbol, direction=approved.direction,
+                side=order.get("side", ""),
+                price=float(order.get("price", 0)),
+                amount=float(order.get("amount", 0)),
+                order_id=order.get("id", ""),
+            )
 
     # ----- strategy pipeline --------------------------------------------
 
@@ -651,12 +688,20 @@ class WebSocketListener:
                     })
                     continue
 
-                self.order_manager.open_position(approved)
+                order = self.order_manager.open_position(approved)
 
                 log.info("signal_executed",
                          symbol=symbol,
                          strategy=strategy.name,
                          direction=approved.direction)
+                if order:
+                    self.telegram.notify_order_placed(
+                        symbol=symbol, direction=approved.direction,
+                        side=order.get("side", ""),
+                        price=float(order.get("price", 0)),
+                        amount=float(order.get("amount", 0)),
+                        order_id=order.get("id", ""),
+                    )
 
             except Exception as exc:
                 log.error("strategy_error",

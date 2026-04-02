@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     live_equity: float = Field(1_000.0, env="LIVE_EQUITY")
     live_risk_pct: float = Field(0.02, env="LIVE_RISK_PCT")
 
+    telegram_bot_token: str = Field("", env="TELEGRAM_BOT_TOKEN")
+    telegram_chat_id: str = Field("", env="TELEGRAM_CHAT_ID")
+
     # Optional: CoinGlass Crypto API (see src/data/coinglass_liquidation.py)
     coinglass_api_key: str = Field("", env="COINGLASS_API_KEY")
     coinglass_base_url: str = Field(
