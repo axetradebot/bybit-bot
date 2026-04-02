@@ -413,6 +413,7 @@ class WebSocketListener:
                 self._compute_indicators(symbol)
             )
             if raw_5m is None:
+                log.warning("indicators_none", symbol=symbol)
                 return
 
             self._write_indicator_row(symbol, raw_5m, Indicators5m)
@@ -634,6 +635,7 @@ class WebSocketListener:
 
         trading_row = self._compute_tf_indicators(symbol, tf)
         if trading_row is None:
+            log.warning("sniper_tf_no_data", symbol=symbol, tf=tf)
             return
 
         ctx_tf = CONTEXT_TF.get(tf, tf)
@@ -654,6 +656,7 @@ class WebSocketListener:
         )
 
         if signal is None or signal.direction == "flat":
+            log.info("sniper_eval", symbol=symbol, tf=tf, result="flat")
             return
 
         log.info("sniper_signal",
