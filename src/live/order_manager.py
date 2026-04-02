@@ -23,8 +23,19 @@ from src.strategies.base import SignalEvent
 log = structlog.get_logger()
 
 
+_SYMBOL_OVERRIDES = {
+    "1000PEPEUSDT": "1000PEPE/USDT:USDT",
+    "1000SHIBUSDT": "1000SHIB/USDT:USDT",
+    "1000FLOKIUSDT": "1000FLOKI/USDT:USDT",
+    "1000BONKUSDT": "1000BONK/USDT:USDT",
+    "1000LUNCUSDT": "1000LUNC/USDT:USDT",
+}
+
+
 def _to_ccxt_symbol(symbol: str) -> str:
     """BTCUSDT -> BTC/USDT:USDT (CCXT linear perp format)."""
+    if symbol in _SYMBOL_OVERRIDES:
+        return _SYMBOL_OVERRIDES[symbol]
     if symbol.endswith("USDT"):
         return f"{symbol[:-4]}/USDT:USDT"
     return symbol
