@@ -67,6 +67,8 @@ log = structlog.get_logger()
 
 # Minimum buffer length before we start running indicators / strategies
 _MIN_BUFFER = 20
+# Bars to keep in memory per symbol (5000 = ~17 days of 5m bars, enough for 4h indicators)
+_BUFFER_SIZE = 5000
 
 
 # -----------------------------------------------------------------------
@@ -159,7 +161,7 @@ class WebSocketListener:
         self.state.symbols = list(settings.symbols)
 
         for symbol in settings.symbols:
-            self._bar_buffer[symbol] = deque(maxlen=200)
+            self._bar_buffer[symbol] = deque(maxlen=_BUFFER_SIZE)
             self._init_buffer(symbol)
 
         self._connect_ws()
@@ -176,25 +178,94 @@ class WebSocketListener:
     # ----- initialisation -----------------------------------------------
 
     def _init_buffer(self, symbol: str) -> None:
-        """Pre-fill bar buffer from the database."""
+        """Pre-fill bar buffer from DB, falling back to Bybit REST API."""
+        loaded = False
+
+        # Try DB first
         try:
             df = pd.read_sql(
                 "SELECT * FROM candles_5m WHERE symbol = %(symbol)s "
-                "ORDER BY timestamp DESC LIMIT 200",
+                "ORDER BY timestamp DESC LIMIT %(n)s",
                 self._engine,
-                params={"symbol": symbol},
+                params={"symbol": symbol, "n": _BUFFER_SIZE},
                 parse_dates=["timestamp"],
             )
             if not df.empty:
                 for _, row in df.sort_values("timestamp").iterrows():
                     self._bar_buffer[symbol].append(row.to_dict())
-                log.info("buffer_initialized",
+                log.info("buffer_from_db",
                          symbol=symbol, bars=len(df))
-            else:
-                log.info("buffer_empty", symbol=symbol)
-        except Exception as exc:
-            log.warning("buffer_init_failed",
-                        symbol=symbol, error=str(exc))
+                loaded = True
+        except Exception:
+            pass
+
+        # Fall back to Bybit REST API
+        if not loaded:
+            try:
+                self._init_buffer_from_bybit(symbol)
+            except Exception as exc:
+                log.warning("buffer_init_failed",
+                            symbol=symbol, error=str(exc))
+
+    def _init_buffer_from_bybit(self, symbol: str) -> None:
+        """Download recent 5m candles from Bybit REST API into the buffer."""
+        from src.live.order_manager import _to_ccxt_symbol
+        import ccxt
+
+        exchange = ccxt.bybit({"enableRateLimit": True})
+        exchange.load_markets()
+        ccxt_sym = _to_ccxt_symbol(symbol)
+
+        if ccxt_sym not in exchange.markets:
+            log.warning("buffer_symbol_not_found", symbol=symbol)
+            return
+
+        now_ms = int(time.time() * 1000)
+        target_bars = _BUFFER_SIZE
+        five_min_ms = 5 * 60 * 1000
+        since = now_ms - (target_bars * five_min_ms)
+
+        all_candles = []
+        current = since
+        limit = 1000
+
+        while current < now_ms and len(all_candles) < target_bars:
+            ohlcv = exchange.fetch_ohlcv(
+                ccxt_sym, "5m", since=current, limit=limit,
+            )
+            if not ohlcv:
+                break
+            for c in ohlcv:
+                if c[0] < now_ms:
+                    all_candles.append(c)
+            last_ts = ohlcv[-1][0]
+            if last_ts <= current:
+                break
+            current = last_ts + 1
+
+        for c in all_candles:
+            bar = {
+                "symbol": symbol,
+                "timestamp": datetime.fromtimestamp(
+                    c[0] / 1000, tz=timezone.utc,
+                ),
+                "open": float(c[1]),
+                "high": float(c[2]),
+                "low": float(c[3]),
+                "close": float(c[4]),
+                "volume": float(c[5]),
+                "buy_volume": None,
+                "sell_volume": None,
+                "volume_delta": None,
+                "quote_volume": float(c[5]) * float(c[4]),
+                "mark_price": None,
+                "funding_rate": None,
+                "trade_count": None,
+            }
+            self._bar_buffer[symbol].append(bar)
+
+        log.info("buffer_from_bybit",
+                 symbol=symbol, bars=len(all_candles))
 
     def _connect_ws(self) -> None:
         """Connect public and (optionally) private WebSocket streams."""
@@ -503,19 +574,22 @@ class WebSocketListener:
     def _compute_tf_indicators(
         self, symbol: str, target_tf: str,
     ) -> pd.Series | None:
-        """Query DB for 5m candles, resample to *target_tf*, compute indicators."""
+        """Build higher-TF indicators from the in-memory bar buffer."""
         lookback = self._TF_LOOKBACK.get(target_tf, 3000)
         try:
-            df_5m = pd.read_sql(
-                "SELECT * FROM candles_5m WHERE symbol = %(s)s "
-                "ORDER BY timestamp DESC LIMIT %(n)s",
-                self._engine,
-                params={"s": symbol, "n": lookback},
-                parse_dates=["timestamp"],
-            ).sort_values("timestamp")
-
-            if len(df_5m) < 100:
+            buf = self._bar_buffer.get(symbol)
+            if not buf or len(buf) < 100:
                 return None
+
+            bars = list(buf)[-lookback:]
+            df_5m = pd.DataFrame(bars)
+            if "timestamp" not in df_5m.columns or len(df_5m) < 100:
+                return None
+
+            df_5m["timestamp"] = pd.to_datetime(df_5m["timestamp"], utc=True)
+            for col in ("open", "high", "low", "close", "volume"):
+                if col in df_5m.columns:
+                    df_5m[col] = pd.to_numeric(df_5m[col], errors="coerce")
 
             resampled = resample_candles(df_5m, target_tf)
             if len(resampled) < 20:
