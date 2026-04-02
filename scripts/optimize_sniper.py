@@ -52,8 +52,9 @@ EQUITY = 1_000.0
 RISK_PCT = 0.02
 LEVERAGE = 10
 
-# ── Parameter grid ──────────────────────────────────────────────────────
-PARAM_GRID = {
+# ── Parameter grids ─────────────────────────────────────────────────────
+# Round 1: wide exploratory sweep
+PARAM_GRID_WIDE = {
     "ema_spread_min": [0.002, 0.003, 0.005, 0.007, 0.01],
     "rsi_long_lo":    [30, 35, 40],
     "rsi_long_hi":    [55, 60, 65],
@@ -64,6 +65,21 @@ PARAM_GRID = {
     "tp_atr_mult":    [3.0, 4.0, 5.0, 6.0],
     "ema_touch_slack": [0.001, 0.002, 0.003, 0.004],
 }
+
+# Round 2: narrow grid centred on round-1 winners
+PARAM_GRID_NARROW = {
+    "ema_spread_min": [0.002, 0.0025, 0.003, 0.0035, 0.004],
+    "rsi_long_lo":    [30, 33, 35, 37],
+    "rsi_long_hi":    [62, 65, 68],
+    "rsi_short_lo":   [32, 35, 38],
+    "rsi_short_hi":   [58, 62, 65, 68, 70],
+    "atr_rank_floor": [0.20, 0.22, 0.25, 0.28, 0.30],
+    "sl_atr_mult":    [1.2, 1.5, 1.8],
+    "tp_atr_mult":    [4.5, 5.0, 5.5, 6.0, 6.5],
+    "ema_touch_slack": [0.0025, 0.003, 0.0035, 0.004],
+}
+
+PARAM_GRID = PARAM_GRID_NARROW  # default to round 2
 
 DEFAULT_MAX_COMBOS = 500
 
@@ -164,12 +180,12 @@ def build_combos(grid: dict, max_combos: int) -> list[dict]:
             if vals not in seen:
                 seen.add(vals)
                 combos.append(dict(zip(keys, vals)))
-        # always include the default params
-        defaults = {k: PARAM_GRID[k][len(PARAM_GRID[k]) // 2] for k in keys}
+        # always include the current live defaults
+        defaults = {k: grid[k][len(grid[k]) // 2] for k in keys}
         defaults.update(
-            ema_spread_min=0.005, rsi_long_lo=35, rsi_long_hi=60,
-            rsi_short_lo=40, rsi_short_hi=65, atr_rank_floor=0.20,
-            sl_atr_mult=2.0, tp_atr_mult=4.0, ema_touch_slack=0.002,
+            ema_spread_min=0.003, rsi_long_lo=35, rsi_long_hi=65,
+            rsi_short_lo=35, rsi_short_hi=65, atr_rank_floor=0.25,
+            sl_atr_mult=1.5, tp_atr_mult=5.0, ema_touch_slack=0.003,
         )
         if defaults not in combos:
             combos[0] = defaults
@@ -250,6 +266,8 @@ def parse_args():
     p.add_argument("--timeframes", nargs="+", default=TIMEFRAMES)
     p.add_argument("--max-combos", type=int, default=DEFAULT_MAX_COMBOS,
                     help="Cap on total parameter combos to test")
+    p.add_argument("--grid", choices=["wide", "narrow"], default="narrow",
+                    help="Grid size: 'wide' for round 1, 'narrow' for round 2")
     return p.parse_args()
 
 
@@ -257,7 +275,8 @@ def parse_args():
 
 def main():
     args = parse_args()
-    combos = build_combos(PARAM_GRID, args.max_combos)
+    grid = PARAM_GRID_WIDE if args.grid == "wide" else PARAM_GRID_NARROW
+    combos = build_combos(grid, args.max_combos)
 
     print(f"\n{'='*80}", flush=True)
     print(f"  SNIPER FILTER OPTIMIZER", flush=True)
@@ -396,10 +415,10 @@ def main():
 
     # ── Comparison: current defaults vs best ────────────────────────────
     default_key = params_str({
-        "atr_rank_floor": 0.20, "ema_spread_min": 0.005,
-        "ema_touch_slack": 0.002, "rsi_long_hi": 60, "rsi_long_lo": 35,
-        "rsi_short_hi": 65, "rsi_short_lo": 40,
-        "sl_atr_mult": 2.0, "tp_atr_mult": 4.0,
+        "atr_rank_floor": 0.25, "ema_spread_min": 0.003,
+        "ema_touch_slack": 0.003, "rsi_long_hi": 65, "rsi_long_lo": 35,
+        "rsi_short_hi": 65, "rsi_short_lo": 35,
+        "sl_atr_mult": 1.5, "tp_atr_mult": 5.0,
     })
     default_entry = combo_agg.get(default_key)
     if default_entry and ranked:
@@ -423,7 +442,7 @@ def main():
 
     fieldnames = [
         "rank", "total_pnl", "total_trades", "wr",
-        *sorted(PARAM_GRID.keys()),
+        *sorted(grid.keys()),
     ]
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

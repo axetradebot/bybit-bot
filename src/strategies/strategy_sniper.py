@@ -15,14 +15,14 @@ Trigger: EMA-21 rejection candle
 Confluence gates (all must pass):
   Context TF  -- EMA-9 > EMA-21 alignment + Supertrend confirms
   Trading TF  -- Full EMA stack (9 > 21 > 50)
-              -- EMA spread > 0.5 %  (trend well-established)
+              -- EMA spread > 0.3 %  (trend well-established)
               -- EMA-21 rejection candle
-              -- RSI 35-60 (long) / 40-65 (short)  (healthy pullback)
+              -- RSI 35-65 (long) / 35-65 (short)  (healthy pullback)
               -- Heikin-Ashi reversal candle
               -- Supertrend direction
-              -- ATR-rank >= 0.20
+              -- ATR-rank >= 0.25
 
-Risk: SL = sl_atr_mult * ATR,  TP = tp_atr_mult * ATR  (default 2:1 R:R).
+Risk: SL = sl_atr_mult * ATR,  TP = tp_atr_mult * ATR  (default 3.3:1 R:R).
 Fill: limit order (maker fees).
 
 All numeric thresholds are configurable via __init__ kwargs so the
@@ -44,15 +44,15 @@ class SniperStrategy(BaseStrategy):
     def __init__(
         self,
         *,
-        ema_spread_min: float = 0.005,
+        ema_spread_min: float = 0.003,
         rsi_long_lo: float = 35,
-        rsi_long_hi: float = 60,
-        rsi_short_lo: float = 40,
+        rsi_long_hi: float = 65,
+        rsi_short_lo: float = 35,
         rsi_short_hi: float = 65,
-        atr_rank_floor: float = 0.20,
-        sl_atr_mult: float = 2.0,
-        tp_atr_mult: float = 4.0,
-        ema_touch_slack: float = 0.002,
+        atr_rank_floor: float = 0.25,
+        sl_atr_mult: float = 1.5,
+        tp_atr_mult: float = 5.0,
+        ema_touch_slack: float = 0.003,
     ):
         self.ema_spread_min = ema_spread_min
         self.rsi_long_lo = rsi_long_lo
