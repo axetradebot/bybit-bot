@@ -22,8 +22,11 @@ Confluence gates (all must pass):
               -- Supertrend direction
               -- ATR-rank >= 0.20
 
-Risk: SL = 2x ATR,  TP = 4x ATR  (2 : 1 R:R).
+Risk: SL = sl_atr_mult * ATR,  TP = tp_atr_mult * ATR  (default 2:1 R:R).
 Fill: limit order (maker fees).
+
+All numeric thresholds are configurable via __init__ kwargs so the
+optimizer can grid-search over them without touching the code.
 """
 
 from __future__ import annotations
@@ -38,7 +41,28 @@ class SniperStrategy(BaseStrategy):
     name = "sniper"
     blocked_regimes: list[tuple[str, str, str]] = []
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        ema_spread_min: float = 0.005,
+        rsi_long_lo: float = 35,
+        rsi_long_hi: float = 60,
+        rsi_short_lo: float = 40,
+        rsi_short_hi: float = 65,
+        atr_rank_floor: float = 0.20,
+        sl_atr_mult: float = 2.0,
+        tp_atr_mult: float = 4.0,
+        ema_touch_slack: float = 0.002,
+    ):
+        self.ema_spread_min = ema_spread_min
+        self.rsi_long_lo = rsi_long_lo
+        self.rsi_long_hi = rsi_long_hi
+        self.rsi_short_lo = rsi_short_lo
+        self.rsi_short_hi = rsi_short_hi
+        self.atr_rank_floor = atr_rank_floor
+        self.sl_atr_mult = sl_atr_mult
+        self.tp_atr_mult = tp_atr_mult
+        self.ema_touch_slack = ema_touch_slack
         self._prev_close: float | None = None
         self._prev_ema21: float | None = None
 
@@ -103,26 +127,28 @@ class SniperStrategy(BaseStrategy):
 
         # ── EMA separation -- trend must be established ────
         ema_spread = abs(ema9 - ema50) / ema50
-        if ema_spread < 0.005:
+        if ema_spread < self.ema_spread_min:
             return None
 
         # ── Trigger: EMA-21 rejection candle ───────────────
+        slack_hi = 1.0 + self.ema_touch_slack
+        slack_lo = 1.0 - self.ema_touch_slack
         if direction == "long":
             if prev_close <= prev_ema21:
                 return None
-            if not (low <= ema21 * 1.002 and close > ema21):
+            if not (low <= ema21 * slack_hi and close > ema21):
                 return None
         else:
             if prev_close >= prev_ema21:
                 return None
-            if not (high >= ema21 * 0.998 and close < ema21):
+            if not (high >= ema21 * slack_lo and close < ema21):
                 return None
 
         # ── RSI: healthy pullback zone ─────────────────────
         rsi = _sf(c.get("rsi_14"))
-        if direction == "long" and not (35 <= rsi <= 60):
+        if direction == "long" and not (self.rsi_long_lo <= rsi <= self.rsi_long_hi):
             return None
-        if direction == "short" and not (40 <= rsi <= 65):
+        if direction == "short" and not (self.rsi_short_lo <= rsi <= self.rsi_short_hi):
             return None
 
         # ── Heikin-Ashi confirms reversal ──────────────────
@@ -142,12 +168,12 @@ class SniperStrategy(BaseStrategy):
 
         # ── Minimum volatility ─────────────────────────────
         atr_rank = _sf(c.get("atr_pct_rank"))
-        if atr_rank < 0.20:
+        if atr_rank < self.atr_rank_floor:
             return None
 
-        # ── Risk: SL = 2x ATR,  TP = 4x ATR (2:1) ────────
-        sl_dist = 2.0 * atr
-        tp_dist = 4.0 * atr
+        # ── Risk: SL / TP via ATR multiples ────────────────
+        sl_dist = self.sl_atr_mult * atr
+        tp_dist = self.tp_atr_mult * atr
 
         if direction == "long":
             sl = close - sl_dist
