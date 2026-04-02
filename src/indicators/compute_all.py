@@ -256,20 +256,27 @@ def compute_ta_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # Derived / custom columns
 # ---------------------------------------------------------------------------
 
+def _col(df: pd.DataFrame, name: str) -> pd.Series:
+    """Get a column or return NaN-filled Series aligned with df's index."""
+    if name in df.columns:
+        return df[name]
+    return pd.Series(np.nan, index=df.index)
+
+
 def compute_derived(df: pd.DataFrame) -> pd.DataFrame:
     # BB Squeeze: BB width (absolute) < KC width (absolute)
-    bb_upper = df.get("BBU_20_2.0_2.0", pd.Series(dtype=float))
-    bb_lower = df.get("BBL_20_2.0_2.0", pd.Series(dtype=float))
-    kc_upper = df.get("KCUe_20_1.5", pd.Series(dtype=float))
-    kc_lower = df.get("KCLe_20_1.5", pd.Series(dtype=float))
+    bb_upper = _col(df, "BBU_20_2.0_2.0")
+    bb_lower = _col(df, "BBL_20_2.0_2.0")
+    kc_upper = _col(df, "KCUe_20_1.5")
+    kc_lower = _col(df, "KCLe_20_1.5")
     df["bb_squeeze"] = (bb_upper - bb_lower) < (kc_upper - kc_lower)
 
     # ATR percentile rank (rolling 288 bars = 1 day of 5m candles)
-    atr = df.get("ATRr_14", pd.Series(dtype=float))
+    atr = _col(df, "ATRr_14")
     df["atr_pct_rank"] = atr.rolling(288, min_periods=1).rank(pct=True)
 
     # VWAP deviation bands (+-1 ATR, +-2 ATR)
-    vwap = df.get("VWAP_D", pd.Series(dtype=float))
+    vwap = _col(df, "VWAP_D")
     df["vwap_dev_upper1"] = vwap + atr
     df["vwap_dev_lower1"] = vwap - atr
     df["vwap_dev_upper2"] = vwap + (atr * 2)
