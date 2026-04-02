@@ -27,7 +27,10 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-import pandas_ta as ta  # noqa: F401 — registers .ta accessor
+try:
+    import pandas_ta as ta  # noqa: F401 — registers .ta accessor
+except ModuleNotFoundError:
+    import pandas_ta_classic as ta  # noqa: F401 — drop-in fork
 import structlog
 from sqlalchemy import create_engine
 from sqlalchemy.dialects.postgresql import insert as pg_insert
