@@ -114,6 +114,7 @@ class WebSocketListener:
         self.state = state
 
         self._bar_buffer: dict[str, deque] = {}
+        self._db_unavailable: bool = False
         self._latest_funding: dict[str, float] = {}
         self._predicted_funding: dict[str, float] = {}
         self._latest_mark: dict[str, float] = {}
@@ -454,6 +455,8 @@ class WebSocketListener:
         """
         bars = list(self._bar_buffer[symbol])
         df = pd.DataFrame(bars)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        df = df.drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
 
         df_ta = compute_ta_indicators(df.copy())
         df_ta = compute_derived(df_ta)
@@ -496,6 +499,8 @@ class WebSocketListener:
     # ----- DB writes ----------------------------------------------------
 
     def _write_candle(self, bar: dict) -> None:
+        if self._db_unavailable:
+            return
         try:
             record = {k: v for k, v in bar.items()}
             table = Candles5m.__table__
@@ -508,12 +513,16 @@ class WebSocketListener:
             )
             with self._engine.begin() as conn:
                 conn.execute(stmt)
-        except Exception as exc:
-            log.error("candle_write_error", error=str(exc))
+        except Exception:
+            self._db_unavailable = True
+            log.warning("db_writes_disabled",
+                        reason="connection failed, skipping future writes")
 
     def _write_indicator_row(
         self, symbol: str, row: pd.Series, model: type,
     ) -> None:
+        if self._db_unavailable:
+            return
         try:
             rec: dict = {
                 "symbol": symbol,
@@ -542,8 +551,8 @@ class WebSocketListener:
             )
             with self._engine.begin() as conn:
                 conn.execute(stmt)
-        except Exception as exc:
-            log.error("indicator_write_error", error=str(exc))
+        except Exception:
+            self._db_unavailable = True
 
     @staticmethod
     def _safe(val: Any) -> float | None:
@@ -587,6 +596,7 @@ class WebSocketListener:
                 return None
 
             df_5m["timestamp"] = pd.to_datetime(df_5m["timestamp"], utc=True)
+            df_5m = df_5m.drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
             for col in ("open", "high", "low", "close", "volume"):
                 if col in df_5m.columns:
                     df_5m[col] = pd.to_numeric(df_5m[col], errors="coerce")
