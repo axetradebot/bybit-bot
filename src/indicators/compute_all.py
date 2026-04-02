@@ -25,7 +25,10 @@ sys.path.insert(0, str(project_root))
 
 from src.config import settings  # noqa: E402
 from src.db.models import Indicators5m, Indicators15m  # noqa: E402
-from src.indicators.custom_indicators import detect_rsi_divergence  # noqa: E402
+from src.indicators.custom_indicators import (  # noqa: E402
+    detect_momentum_divergence,
+    detect_rsi_divergence,
+)
 from src.indicators.resample import resample_5m_to_15m  # noqa: E402
 
 log = structlog.get_logger()
@@ -39,6 +42,7 @@ TA_COL_MAP: dict[str, str] = {
     "EMA_50": "ema_50",
     "EMA_200": "ema_200",
     "RSI_14": "rsi_14",
+    "MFI_14": "mfi_14",
     "STOCHRSIk_14_14_3_3": "stochrsi_k",
     "STOCHRSId_14_14_3_3": "stochrsi_d",
     "MACD_12_26_9": "macd_line",
@@ -74,6 +78,17 @@ DIV_COLS = [
     "div_regular_bull", "div_regular_bear",
     "div_hidden_bull", "div_hidden_bear",
 ]
+
+MOM_WAVE_COLS = [
+    "mom_wave_regular_bull", "mom_wave_regular_bear",
+    "mom_wave_hidden_bull", "mom_wave_hidden_bear",
+]
+
+COINGLASS_EXTRA_MAP = (
+    ("coinglass_long_liq_usd", "cg_long_liq_usd"),
+    ("coinglass_short_liq_usd", "cg_short_liq_usd"),
+    ("coinglass_liq_imb", "cg_liq_imb"),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +227,7 @@ def compute_ta_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df.ta.ema(length=200, append=True)
 
     df.ta.rsi(length=14, append=True)
+    df.ta.mfi(length=14, append=True)
     df.ta.stochrsi(length=14, rsi_length=14, k=3, d=3, append=True)
 
     df.ta.macd(fast=12, slow=26, signal=9, append=True)
@@ -351,6 +367,32 @@ def _safe_int(val):
     return int(val)
 
 
+def pack_indicator_extras(row: pd.Series) -> dict:
+    """Build ``extras`` JSON for DB / live (RSI div, MACD mom-wave div, CoinGlass)."""
+
+    def _xb(v) -> bool:
+        if v is None:
+            return False
+        if isinstance(v, float) and np.isnan(v):
+            return False
+        return bool(v)
+
+    extras: dict = {}
+    for c in DIV_COLS:
+        extras[c] = _xb(row.get(c, False))
+    for c in MOM_WAVE_COLS:
+        extras[c] = _xb(row.get(c, False))
+    for col, key in COINGLASS_EXTRA_MAP:
+        v = row.get(col)
+        if v is not None:
+            try:
+                if not (isinstance(v, float) and np.isnan(v)):
+                    extras[key] = float(v)
+            except (TypeError, ValueError):
+                pass
+    return extras
+
+
 def _safe_bool(val):
     if val is None:
         return None
@@ -380,23 +422,7 @@ def build_records(df: pd.DataFrame, symbol: str) -> list[dict]:
 
         rec["bb_squeeze"] = _safe_bool(row.get("bb_squeeze"))
 
-        extras = {}
-        for c in DIV_COLS:
-            v = row.get(c, False)
-            extras[c] = bool(v) if v is not None and not (isinstance(v, float) and np.isnan(v)) else False
-        for col, key in (
-            ("coinglass_long_liq_usd", "cg_long_liq_usd"),
-            ("coinglass_short_liq_usd", "cg_short_liq_usd"),
-            ("coinglass_liq_imb", "cg_liq_imb"),
-        ):
-            v = row.get(col)
-            if v is not None:
-                try:
-                    if not (isinstance(v, float) and np.isnan(v)):
-                        extras[key] = float(v)
-                except (TypeError, ValueError):
-                    pass
-        rec["extras"] = extras
+        rec["extras"] = pack_indicator_extras(row)
 
         records.append(rec)
     return records
@@ -461,6 +487,7 @@ def run_pipeline(
     df = compute_ta_indicators(df)
     df = compute_derived(df)
     df = detect_rsi_divergence(df)
+    df = detect_momentum_divergence(df)
     df = join_funding(df, funding_df)
     df = join_liquidations(df, liq_df)
     df = join_coinglass_liquidations(df, cg_df)
@@ -480,6 +507,7 @@ def run_pipeline(
     df_15m = compute_ta_indicators(df_15m)
     df_15m = compute_derived(df_15m)
     df_15m = detect_rsi_divergence(df_15m)
+    df_15m = detect_momentum_divergence(df_15m)
     df_15m = join_funding(df_15m, funding_df)
     df_15m = join_liquidations(df_15m, liq_df)
     df_15m = join_coinglass_liquidations(df_15m, cg_df)

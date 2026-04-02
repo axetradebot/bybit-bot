@@ -1,9 +1,15 @@
-version: '3.8'
+# Local dev: TimescaleDB + optional Tardis replay.
+# Requires .env with DB_USER, DB_PASSWORD, TARDIS_API_KEY (use a placeholder for Tardis if you only need Postgres).
+# Compose V2 — no top-level "version" key.
+# Match Docker volume prefix so existing data in bybit_futures_bot_timescale_data is reused.
+name: bybit_futures_bot
+
 services:
   timescaledb:
     image: timescale/timescaledb:latest-pg16
     container_name: bybit_timescaledb
     restart: unless-stopped
+    env_file: .env
     environment:
       POSTGRES_DB: bybit_shadow
       POSTGRES_USER: ${DB_USER}
@@ -28,9 +34,10 @@ services:
       retries: 5
 
   tardis-machine:
-    image: tardisdev/tardis-machine
+    image: tardisdev/tardis-machine:latest
     container_name: bybit_tardis_machine
     restart: unless-stopped
+    env_file: .env
     environment:
       TM_API_KEY: ${TARDIS_API_KEY}
     ports:

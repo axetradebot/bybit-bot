@@ -121,6 +121,7 @@ class Indicators5m(Base):
 
     # Momentum
     rsi_14: Mapped[float | None] = mapped_column(Numeric(10, 4))
+    mfi_14: Mapped[float | None] = mapped_column(Numeric(10, 4))
     stochrsi_k: Mapped[float | None] = mapped_column(Numeric(10, 4))
     stochrsi_d: Mapped[float | None] = mapped_column(Numeric(10, 4))
     macd_line: Mapped[float | None] = mapped_column(Numeric(20, 8))
@@ -186,6 +187,7 @@ class Indicators15m(Base):
 
     # Momentum
     rsi_14: Mapped[float | None] = mapped_column(Numeric(10, 4))
+    mfi_14: Mapped[float | None] = mapped_column(Numeric(10, 4))
     stochrsi_k: Mapped[float | None] = mapped_column(Numeric(10, 4))
     stochrsi_d: Mapped[float | None] = mapped_column(Numeric(10, 4))
     macd_line: Mapped[float | None] = mapped_column(Numeric(20, 8))

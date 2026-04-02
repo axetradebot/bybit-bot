@@ -68,7 +68,7 @@ class VolumeDeltaLiqStrategy(BaseStrategy):
             return None
 
         atr_rank = _sf(c.get("atr_pct_rank"))
-        if atr_rank < 0.15:
+        if atr_rank < 0.18:
             return None
 
         h = list(self._history)
@@ -76,8 +76,8 @@ class VolumeDeltaLiqStrategy(BaseStrategy):
         prev = h[-2]
 
         # Aggressive flow
-        long_flow = curr["order_flow_imb"] > 0.60
-        short_flow = curr["order_flow_imb"] < 0.40
+        long_flow = curr["order_flow_imb"] > 0.63
+        short_flow = curr["order_flow_imb"] < 0.37
 
         # Volume delta: 2+ of last 3 bars in same direction, current accelerating
         vd = [bar["volume_delta"] for bar in h[-3:]]
@@ -97,7 +97,7 @@ class VolumeDeltaLiqStrategy(BaseStrategy):
             return None
         range_high = max(b["high"] for b in prev5)
         range_low = min(b["low"] for b in prev5)
-        tight = (range_high - range_low) < 1.8 * atr
+        tight = (range_high - range_low) < 1.6 * atr
 
         close = curr["close"]
         long_break = close > range_high
@@ -112,11 +112,11 @@ class VolumeDeltaLiqStrategy(BaseStrategy):
         if long_flow and long_delta and vol_spike and tight and long_break and long_trend:
             direction = "long"
             sl = range_low - 0.3 * atr
-            tp = close + (close - sl) * 2.0
+            tp = close + (close - sl) * 2.5
         elif short_flow and short_delta and vol_spike and tight and short_break and short_trend:
             direction = "short"
             sl = range_high + 0.3 * atr
-            tp = close - (sl - close) * 2.0
+            tp = close - (sl - close) * 2.5
 
         if direction is None:
             return None
@@ -147,4 +147,4 @@ class VolumeDeltaLiqStrategy(BaseStrategy):
             timestamp=ts,
             fill_mode="market",
         )
-        return sig if sig.risk_reward() >= 1.8 else None
+        return sig if sig.risk_reward() >= 2.0 else None

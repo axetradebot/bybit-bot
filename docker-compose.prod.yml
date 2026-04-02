@@ -1,8 +1,12 @@
+# Production-style compose (tune ports/resources for the host).
+name: bybit_futures_bot
+
 services:
   timescaledb:
     image: timescale/timescaledb:latest-pg16
     container_name: bybit_timescaledb
     restart: always
+    env_file: .env
     environment:
       POSTGRES_DB: bybit_shadow
       POSTGRES_USER: ${DB_USER}
@@ -34,9 +38,10 @@ services:
           memory: 4G
 
   tardis-machine:
-    image: tardisdev/tardis-machine
+    image: tardisdev/tardis-machine:latest
     container_name: bybit_tardis_machine
     restart: unless-stopped
+    env_file: .env
     environment:
       TM_API_KEY: ${TARDIS_API_KEY}
     ports:

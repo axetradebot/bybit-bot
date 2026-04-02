@@ -51,7 +51,7 @@ class MultiTFScalpStrategy(BaseStrategy):
             return None
 
         atr_rank = _sf(c5.get("atr_pct_rank"))
-        if atr_rank < 0.15:
+        if atr_rank < 0.22:
             return None
 
         # 15m: full EMA stack
@@ -83,9 +83,9 @@ class MultiTFScalpStrategy(BaseStrategy):
         direction = None
 
         if long_15m:
-            near_ema = abs(close - ema21) <= 1.2 * atr
-            flow_ok = curr_ofi > 0.58
-            rsi_ok = 38 <= rsi <= 68
+            near_ema = abs(close - ema21) <= 1.1 * atr
+            flow_ok = curr_ofi > 0.65
+            rsi_ok = 40 <= rsi <= 66
             macd_accel = curr_macd > 0 and curr_macd > prev_macd
             trend_ok = close > ema50
             st_ok = st_dir > 0
@@ -93,12 +93,12 @@ class MultiTFScalpStrategy(BaseStrategy):
             if near_ema and flow_ok and rsi_ok and macd_accel and trend_ok and st_ok:
                 direction = "long"
                 sl = close - 1.2 * atr
-                tp = close + 2.4 * atr
+                tp = close + 2.8 * atr
 
         if direction is None and short_15m:
-            near_ema = abs(close - ema21) <= 1.2 * atr
-            flow_ok = curr_ofi < 0.42
-            rsi_ok = 32 <= rsi <= 62
+            near_ema = abs(close - ema21) <= 1.1 * atr
+            flow_ok = curr_ofi < 0.35
+            rsi_ok = 34 <= rsi <= 60
             macd_accel = curr_macd < 0 and curr_macd < prev_macd
             trend_ok = close < ema50
             st_ok = st_dir < 0
@@ -106,7 +106,7 @@ class MultiTFScalpStrategy(BaseStrategy):
             if near_ema and flow_ok and rsi_ok and macd_accel and trend_ok and st_ok:
                 direction = "short"
                 sl = close + 1.2 * atr
-                tp = close - 2.4 * atr
+                tp = close - 2.8 * atr
 
         if direction is None:
             return None
@@ -137,4 +137,4 @@ class MultiTFScalpStrategy(BaseStrategy):
             timestamp=ts,
             fill_mode="market",
         )
-        return sig if sig.risk_reward() >= 1.8 else None
+        return sig if sig.risk_reward() >= 2.0 else None

@@ -57,13 +57,13 @@ class BBSqueezeStrategy(BaseStrategy):
             return None
 
         atr_rank = _sf(curr.get("atr_pct_rank"))
-        if atr_rank < 0.10:
+        if atr_rank < 0.25:
             return None
 
-        # BB expansion > 0.3 ATR
+        # BB expansion > 0.35 ATR (stronger release)
         curr_bb_w = _sf(curr.get("bb_upper")) - _sf(curr.get("bb_lower"))
         prev_bb_w = prev["bb_upper"] - prev["bb_lower"]
-        if curr_bb_w - prev_bb_w <= 0.3 * atr:
+        if curr_bb_w - prev_bb_w <= 0.35 * atr:
             return None
 
         ema9 = _sf(curr.get("ema_9"))
@@ -86,8 +86,8 @@ class BBSqueezeStrategy(BaseStrategy):
         short_trend = ema9 < ema21 < ema50
         long_macd = macd_h > 0 and macd_h > prev_macd
         short_macd = macd_h < 0 and macd_h < prev_macd
-        long_flow = ofi > 0.57
-        short_flow = ofi < 0.43
+        long_flow = ofi > 0.60
+        short_flow = ofi < 0.40
         long_vwap = close > vwap
         short_vwap = close < vwap
         long_st = st_dir > 0
@@ -96,11 +96,11 @@ class BBSqueezeStrategy(BaseStrategy):
         if long_trend and long_macd and long_flow and long_vwap and long_st:
             direction = "long"
             sl = prev["low"] - 0.5 * atr
-            tp = close + (close - sl) * 2.0
+            tp = close + (close - sl) * 2.5
         elif short_trend and short_macd and short_flow and short_vwap and short_st:
             direction = "short"
             sl = prev["high"] + 0.5 * atr
-            tp = close - (sl - close) * 2.0
+            tp = close - (sl - close) * 2.5
         else:
             return None
 
@@ -135,4 +135,4 @@ class BBSqueezeStrategy(BaseStrategy):
             timestamp=ts,
             fill_mode="market",
         )
-        return sig if sig.risk_reward() >= 1.8 else None
+        return sig if sig.risk_reward() >= 2.0 else None

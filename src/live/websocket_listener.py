@@ -42,12 +42,22 @@ from src.indicators.compute_all import (  # noqa: E402
     DERIVED_FLOAT_COLS,
     compute_derived,
     compute_ta_indicators,
+    pack_indicator_extras,
 )
-from src.indicators.resample import resample_5m_to_15m  # noqa: E402
+from src.indicators.custom_indicators import (  # noqa: E402
+    detect_momentum_divergence,
+    detect_rsi_divergence,
+)
+from src.indicators.resample import (  # noqa: E402
+    resample_5m_to_15m,
+    resample_candles,
+    CONTEXT_TF,
+)
 from src.live.order_manager import OrderManager  # noqa: E402
 from src.risk.risk_manager import RiskManager  # noqa: E402
 from src.strategies import STRATEGY_REGISTRY  # noqa: E402
 from src.strategies.base import BaseStrategy, _sf  # noqa: E402
+from src.strategies.strategy_sniper import SniperStrategy  # noqa: E402
 
 log = structlog.get_logger()
 
@@ -103,8 +113,12 @@ class WebSocketListener:
         self._latest_mark: dict[str, float] = {}
         self._latest_15m: dict[str, pd.Series] = {}
 
+        wanted = settings.live_strategy.lower()
+
         self._strategies: list[BaseStrategy] = []
         for name, cls in STRATEGY_REGISTRY.items():
+            if wanted != "all" and name != wanted:
+                continue
             try:
                 if name == "regime_adaptive":
                     self._strategies.append(cls(engine=engine))
@@ -114,13 +128,22 @@ class WebSocketListener:
                 log.warning("strategy_init_failed",
                             strategy=name, error=str(exc))
 
-        self.risk_manager = RiskManager(is_backtest=False)
+        self._sniper_15m: dict[str, SniperStrategy] = {}
+        self._sniper_4h: dict[str, SniperStrategy] = {}
+        self._sniper_tfs: list[str] = ["15m", "4h"]
+
+        self.risk_manager = RiskManager(
+            is_backtest=False, risk_pct=settings.live_risk_pct,
+        )
         self.order_manager = OrderManager(engine)
-        self._equity = 10_000.0
+        self._equity = settings.live_equity
 
         log.info("listener_initialized",
                  strategies=[s.name for s in self._strategies],
-                 symbols=settings.symbols)
+                 sniper_tfs=self._sniper_tfs,
+                 symbols=settings.symbols,
+                 equity=self._equity,
+                 risk_pct=settings.live_risk_pct)
 
     # ----- public -------------------------------------------------------
 
@@ -293,13 +316,15 @@ class WebSocketListener:
                          need=_MIN_BUFFER)
                 return
 
-            ind_5m, ind_15m = self._compute_indicators(symbol)
-            if ind_5m is None:
+            raw_5m, ind_5m, raw_15m, ind_15m = (
+                self._compute_indicators(symbol)
+            )
+            if raw_5m is None:
                 return
 
-            self._write_indicator_row(symbol, ind_5m, Indicators5m)
-            if ind_15m is not None:
-                self._write_indicator_row(symbol, ind_15m, Indicators15m)
+            self._write_indicator_row(symbol, raw_5m, Indicators5m)
+            if raw_15m is not None:
+                self._write_indicator_row(symbol, raw_15m, Indicators15m)
 
             self.state.update_last_bar(symbol, bar["timestamp"])
 
@@ -310,6 +335,14 @@ class WebSocketListener:
 
             self._run_strategies(symbol, ind_5m, ind_15m)
 
+            # Higher-TF sniper: detect when 15m / 4h bars close
+            bar_ts = bar["timestamp"]
+            close_min = bar_ts.hour * 60 + bar_ts.minute + 5
+            if close_min % 15 == 0:
+                self._run_sniper_on_tf(symbol, "15m")
+            if close_min % 240 == 0:
+                self._run_sniper_on_tf(symbol, "4h")
+
         except Exception as exc:
             log.error("bar_processing_error",
                       symbol=symbol, error=str(exc), exc_info=True)
@@ -318,30 +351,47 @@ class WebSocketListener:
 
     def _compute_indicators(
         self, symbol: str,
-    ) -> tuple[pd.Series | None, pd.Series | None]:
+    ) -> tuple[pd.Series | None, pd.Series | None,
+               pd.Series | None, pd.Series | None]:
         """
         Compute 5m (and 15m) indicators on the full bar buffer.
-        Returns (indicators_5m_row, indicators_15m_row_or_None).
+
+        Returns (raw_5m, ind_5m, raw_15m, ind_15m) where:
+          raw_*  = TA column names  (for DB writes)
+          ind_*  = DB column names  (for strategies)
         """
         bars = list(self._bar_buffer[symbol])
         df = pd.DataFrame(bars)
 
         df_ta = compute_ta_indicators(df.copy())
         df_ta = compute_derived(df_ta)
+        df_ta = detect_rsi_divergence(df_ta)
+        df_ta = detect_momentum_divergence(df_ta)
 
-        ind_5m = df_ta.iloc[-1].copy()
+        raw_5m = df_ta.iloc[-1].copy()
         funding = self._latest_funding.get(symbol, 0.0)
-        ind_5m["funding_8h"] = funding
-        ind_5m["funding_24h_cum"] = funding * 3
-        ind_5m["liq_volume_1h"] = 0.0
+        raw_5m["funding_8h"] = funding
+        raw_5m["funding_24h_cum"] = funding * 3
+        raw_5m["liq_volume_1h"] = 0.0
+        raw_5m["extras"] = pack_indicator_extras(raw_5m)
 
+        _rn = {ta: db for ta, db in TA_COL_MAP.items() if ta in raw_5m.index}
+        ind_5m = raw_5m.rename(_rn)
+
+        raw_15m: pd.Series | None = None
         ind_15m: pd.Series | None = None
         try:
             df_15m = resample_5m_to_15m(df)
             if not df_15m.empty and len(df_15m) >= 10:
                 df_15m_ta = compute_ta_indicators(df_15m.copy())
                 df_15m_ta = compute_derived(df_15m_ta)
-                ind_15m = df_15m_ta.iloc[-1].copy()
+                df_15m_ta = detect_rsi_divergence(df_15m_ta)
+                df_15m_ta = detect_momentum_divergence(df_15m_ta)
+                raw_15m = df_15m_ta.iloc[-1].copy()
+                raw_15m["extras"] = pack_indicator_extras(raw_15m)
+                _rn15 = {ta: db for ta, db in TA_COL_MAP.items()
+                         if ta in raw_15m.index}
+                ind_15m = raw_15m.rename(_rn15)
                 self._latest_15m[symbol] = ind_15m
         except Exception as exc:
             log.warning("15m_error", symbol=symbol, error=str(exc))
@@ -349,7 +399,7 @@ class WebSocketListener:
         if ind_15m is None:
             ind_15m = self._latest_15m.get(symbol)
 
-        return ind_5m, ind_15m
+        return raw_5m, ind_5m, raw_15m, ind_15m
 
     # ----- DB writes ----------------------------------------------------
 
@@ -387,7 +437,8 @@ class WebSocketListener:
             for col in DERIVED_FLOAT_COLS:
                 rec[col] = self._safe(row.get(col))
             rec["bb_squeeze"] = self._safe_bool(row.get("bb_squeeze"))
-            rec["extras"] = {}
+            ex = row.get("extras")
+            rec["extras"] = ex if isinstance(ex, dict) else pack_indicator_extras(row)
 
             table = model.__table__
             pk = [c.name for c in table.primary_key.columns]
@@ -423,6 +474,123 @@ class WebSocketListener:
         except (TypeError, ValueError):
             pass
         return bool(val)
+
+    # ----- multi-TF sniper -----------------------------------------------
+
+    _TF_LOOKBACK = {"15m": 600, "1h": 1500, "4h": 4800}
+
+    def _compute_tf_indicators(
+        self, symbol: str, target_tf: str,
+    ) -> pd.Series | None:
+        """Query DB for 5m candles, resample to *target_tf*, compute indicators."""
+        lookback = self._TF_LOOKBACK.get(target_tf, 3000)
+        try:
+            df_5m = pd.read_sql(
+                "SELECT * FROM candles_5m WHERE symbol = %(s)s "
+                "ORDER BY timestamp DESC LIMIT %(n)s",
+                self._engine,
+                params={"s": symbol, "n": lookback},
+                parse_dates=["timestamp"],
+            ).sort_values("timestamp")
+
+            if len(df_5m) < 100:
+                return None
+
+            resampled = resample_candles(df_5m, target_tf)
+            if len(resampled) < 20:
+                return None
+
+            with_ta = compute_ta_indicators(resampled)
+            with_derived = compute_derived(with_ta)
+            last = with_derived.iloc[-1].copy()
+
+            last["funding_8h"] = self._latest_funding.get(symbol, 0.0)
+            last["liq_volume_1h"] = 0.0
+            last["extras"] = {}
+
+            _rn = {ta: db for ta, db in TA_COL_MAP.items()
+                   if ta in last.index}
+            return last.rename(_rn)
+        except Exception as exc:
+            log.warning("tf_indicator_error",
+                        symbol=symbol, tf=target_tf, error=str(exc))
+            return None
+
+    def _run_sniper_on_tf(self, symbol: str, tf: str) -> None:
+        """Run the sniper strategy on a higher TF bar that just closed."""
+        sniper_map = {"15m": self._sniper_15m, "4h": self._sniper_4h}
+        instances = sniper_map.get(tf)
+        if instances is None:
+            return
+
+        if symbol not in instances:
+            instances[symbol] = SniperStrategy()
+        strategy = instances[symbol]
+
+        trading_row = self._compute_tf_indicators(symbol, tf)
+        if trading_row is None:
+            return
+
+        ctx_tf = CONTEXT_TF.get(tf, tf)
+        if ctx_tf == tf:
+            context_row = trading_row
+        else:
+            context_row = self._compute_tf_indicators(symbol, ctx_tf)
+            if context_row is None:
+                context_row = pd.Series(dtype=object)
+
+        funding = self._latest_funding.get(symbol, 0.0)
+        signal = strategy.generate_signal(
+            symbol=symbol,
+            indicators_5m=trading_row,
+            indicators_15m=context_row,
+            funding_rate=funding,
+            liq_volume_1h=0.0,
+        )
+
+        if signal is None or signal.direction == "flat":
+            return
+
+        log.info("sniper_signal",
+                 symbol=symbol, tf=tf,
+                 direction=signal.direction,
+                 entry=signal.entry_price,
+                 sl=signal.stop_loss,
+                 tp=signal.take_profit)
+
+        positions = self.order_manager.sync_positions()
+        daily_pnl = self.order_manager.get_daily_pnl()
+        predicted = self._predicted_funding.get(symbol, funding)
+
+        approved = self.risk_manager.evaluate(
+            signal=signal,
+            account_equity=self._equity,
+            open_positions=positions,
+            daily_pnl_usd=daily_pnl,
+            current_funding_rate=funding,
+            predicted_funding_rate=predicted,
+            session=self._engine,
+        )
+
+        if approved is None:
+            last = (
+                self.risk_manager._blocked[-1]
+                if self.risk_manager._blocked
+                else {}
+            )
+            self.state.add_blocked({
+                "symbol": symbol,
+                "strategy": f"sniper_{tf}",
+                "direction": signal.direction,
+                "reason": last.get("exit_reason", "unknown"),
+                "timestamp": signal.timestamp.isoformat(),
+            })
+            return
+
+        self.order_manager.open_position(approved)
+        log.info("sniper_executed",
+                 symbol=symbol, tf=tf,
+                 direction=approved.direction)
 
     # ----- strategy pipeline --------------------------------------------
 

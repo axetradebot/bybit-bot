@@ -1,4 +1,4 @@
-"""Custom indicators not available in pandas_ta — RSI divergence detection."""
+"""Custom indicators not available in pandas_ta — RSI / momentum divergence."""
 
 from __future__ import annotations
 
@@ -87,4 +87,83 @@ def detect_rsi_divergence(
     df["div_regular_bear"] = reg_bear
     df["div_hidden_bull"] = hid_bull
     df["div_hidden_bear"] = hid_bear
+    return df
+
+
+def detect_momentum_divergence(
+    df: pd.DataFrame,
+    lookback: int = 20,
+    min_bars_between_pivots: int = 3,
+    osc_col: str = "MACDh_12_26_9",
+) -> pd.DataFrame:
+    """
+    Regular / hidden divergence on MACD histogram (momentum "waves") vs price.
+
+    Same pivot rules as :func:`detect_rsi_divergence`, oscillator at pivots
+    instead of RSI. Adds columns:
+
+    - mom_wave_regular_bull, mom_wave_regular_bear
+    - mom_wave_hidden_bull, mom_wave_hidden_bear
+    """
+    n = len(df)
+    reg_bull = np.zeros(n, dtype=bool)
+    reg_bear = np.zeros(n, dtype=bool)
+    hid_bull = np.zeros(n, dtype=bool)
+    hid_bear = np.zeros(n, dtype=bool)
+
+    if n < lookback or osc_col not in df.columns:
+        df["mom_wave_regular_bull"] = reg_bull
+        df["mom_wave_regular_bear"] = reg_bear
+        df["mom_wave_hidden_bull"] = hid_bull
+        df["mom_wave_hidden_bear"] = hid_bear
+        return df
+
+    low = df["low"].values.astype(np.float64)
+    high = df["high"].values.astype(np.float64)
+    osc = df[osc_col].values.astype(np.float64)
+
+    half = lookback // 2
+
+    pivot_low_idx: list[int] = []
+    pivot_high_idx: list[int] = []
+
+    for i in range(half, n - half):
+        lo_win = low[i - half : i + half + 1]
+        hi_win = high[i - half : i + half + 1]
+
+        if low[i] <= np.nanmin(lo_win):
+            pivot_low_idx.append(i)
+        if high[i] >= np.nanmax(hi_win):
+            pivot_high_idx.append(i)
+
+    for j in range(1, len(pivot_low_idx)):
+        prev_i = pivot_low_idx[j - 1]
+        curr_i = pivot_low_idx[j]
+        if curr_i - prev_i < min_bars_between_pivots:
+            continue
+        if np.isnan(osc[prev_i]) or np.isnan(osc[curr_i]):
+            continue
+
+        if low[curr_i] < low[prev_i] and osc[curr_i] > osc[prev_i]:
+            reg_bull[curr_i] = True
+        if low[curr_i] > low[prev_i] and osc[curr_i] < osc[prev_i]:
+            hid_bull[curr_i] = True
+
+    for j in range(1, len(pivot_high_idx)):
+        prev_i = pivot_high_idx[j - 1]
+        curr_i = pivot_high_idx[j]
+        if curr_i - prev_i < min_bars_between_pivots:
+            continue
+        if np.isnan(osc[prev_i]) or np.isnan(osc[curr_i]):
+            continue
+
+        if high[curr_i] > high[prev_i] and osc[curr_i] < osc[prev_i]:
+            reg_bear[curr_i] = True
+        if high[curr_i] < high[prev_i] and osc[curr_i] > osc[prev_i]:
+            hid_bear[curr_i] = True
+
+    df["mom_wave_regular_bull"] = reg_bull
+    df["mom_wave_regular_bear"] = reg_bear
+    df["mom_wave_hidden_bull"] = hid_bull
+    df["mom_wave_hidden_bear"] = hid_bear
     return df

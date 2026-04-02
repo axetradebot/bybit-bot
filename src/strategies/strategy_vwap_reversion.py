@@ -17,7 +17,8 @@ class VWAPReversionStrategy(BaseStrategy):
         ("medium", "negative", "new_york"),
         ("medium", "positive", "new_york"),
         ("medium", "negative", "asia"),
-        ("high",   "*",        "off_hours"),
+        # Mean reversion bleeds in high vol (worst USD/trade in backtest slice)
+        ("high",   "*",        "*"),
     ]
 
     def generate_signal(
@@ -50,18 +51,18 @@ class VWAPReversionStrategy(BaseStrategy):
         if atr <= 0:
             return None
 
-        funding_neutral = -0.0002 <= funding_rate <= 0.0002
+        funding_neutral = -0.00015 <= funding_rate <= 0.00015
         not_squeeze = squeeze is not True and squeeze != True  # noqa: E712
 
         direction = None
 
-        if (close < vwap_lo1 and rsi < 35 and atr_rank < 0.50
-                and funding_neutral and not_squeeze and ofi > 0.52):
+        if (close < vwap_lo1 and rsi < 32 and atr_rank < 0.40
+                and funding_neutral and not_squeeze and ofi > 0.55):
             direction = "long"
             sl = vwap_lo2 - 0.2 * atr
             tp = vwap
-        elif (close > vwap_hi1 and rsi > 65 and atr_rank < 0.50
-              and funding_neutral and not_squeeze and ofi < 0.48):
+        elif (close > vwap_hi1 and rsi > 68 and atr_rank < 0.40
+              and funding_neutral and not_squeeze and ofi < 0.45):
             direction = "short"
             sl = vwap_hi2 + 0.2 * atr
             tp = vwap
@@ -96,4 +97,4 @@ class VWAPReversionStrategy(BaseStrategy):
             timestamp=ts,
             fill_mode="limit",
         )
-        return sig if sig.risk_reward() >= 1.5 else None
+        return sig if sig.risk_reward() >= 1.8 else None

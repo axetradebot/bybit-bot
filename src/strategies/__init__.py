@@ -20,6 +20,8 @@ from src.strategies.strategy_vwap_reversion import VWAPReversionStrategy
 from src.strategies.strategy_multitf_scalp import MultiTFScalpStrategy
 from src.strategies.strategy_volume_delta_liq import VolumeDeltaLiqStrategy
 from src.strategies.strategy_regime_adaptive import RegimeAdaptiveStrategy
+from src.strategies.strategy_high_winrate import HighWinRateStrategy
+from src.strategies.strategy_sniper import SniperStrategy
 
 if TYPE_CHECKING:
     from src.strategies.base import BaseStrategy
@@ -32,6 +34,8 @@ STRATEGY_REGISTRY: dict[str, type] = {
     "multitf_scalp": MultiTFScalpStrategy,
     "volume_delta_liq": VolumeDeltaLiqStrategy,
     "regime_adaptive": RegimeAdaptiveStrategy,
+    "high_winrate": HighWinRateStrategy,
+    "sniper": SniperStrategy,
 }
 
 # Mean-reversion: post limit at signal price, maker fees. Momentum: next-bar market, taker fees.
@@ -63,6 +67,7 @@ class StrategyAdapter:
         symbol: str,
         from_date: str,
         to_date: str,
+        context_df: pd.DataFrame | None = None,
     ):
         self.base = base
         self.name = base.name
@@ -70,7 +75,10 @@ class StrategyAdapter:
 
         self._15m_ts: list[pd.Timestamp] = []
         self._15m_rows: list[pd.Series] = []
-        self._load_15m(engine, symbol, from_date, to_date)
+        if context_df is not None:
+            self._load_context_df(context_df)
+        else:
+            self._load_15m(engine, symbol, from_date, to_date)
 
     def _load_15m(self, engine, symbol: str, from_date: str, to_date: str):
         df = pd.read_sql(
@@ -89,6 +97,12 @@ class StrategyAdapter:
         for _, row in df.iterrows():
             self._15m_ts.append(pd.Timestamp(row["timestamp"]))
             self._15m_rows.append(row)
+
+    def _load_context_df(self, df: pd.DataFrame) -> None:
+        if df.empty:
+            return
+        self._15m_ts = [pd.Timestamp(t) for t in df["timestamp"]]
+        self._15m_rows = [df.iloc[i] for i in range(len(df))]
 
     def _get_15m_row(self, ts: pd.Timestamp) -> pd.Series:
         if not self._15m_ts:

@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     bybit_testnet: bool = Field(True, env="BYBIT_TESTNET")
     bybit_demo: bool = Field(False, env="BYBIT_DEMO")
 
+    live_strategy: str = Field("all", env="LIVE_STRATEGY")
+    live_equity: float = Field(1_000.0, env="LIVE_EQUITY")
+    live_risk_pct: float = Field(0.02, env="LIVE_RISK_PCT")
+
     # Optional: CoinGlass Crypto API (see src/data/coinglass_liquidation.py)
     coinglass_api_key: str = Field("", env="COINGLASS_API_KEY")
     coinglass_base_url: str = Field(

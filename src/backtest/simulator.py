@@ -29,7 +29,7 @@ COOLDOWN_BARS = 6         # minimum bars between trades (30 min on 5m)
 
 INDICATOR_COLS = [
     "ema_9", "ema_21", "ema_50", "ema_200",
-    "rsi_14", "stochrsi_k", "stochrsi_d",
+    "rsi_14", "mfi_14", "stochrsi_k", "stochrsi_d",
     "macd_line", "macd_signal", "macd_hist",
     "macd_fast_line", "macd_fast_signal", "macd_fast_hist",
     "bb_upper", "bb_mid", "bb_lower", "bb_width",
@@ -209,26 +209,34 @@ class Simulator:
         leverage: int = 10,
         risk_pct: float = 0.02,
         equity: float = 10_000.0,
+        fixed_risk: bool = False,
     ):
         self.strategy = strategy
         self.symbol = symbol
         self.leverage = leverage
         self.risk_pct = risk_pct
         self.equity = equity
+        self._initial_equity = equity
+        self.fixed_risk = fixed_risk
 
     def run(
         self,
         engine,
         from_date: str,
         to_date: str,
+        bars: pd.DataFrame | None = None,
     ) -> list[ClosedTrade]:
-        bars = self._load_bars(engine, from_date, to_date)
+        if bars is not None:
+            bar_data = bars
+            log.info("bars_loaded", rows=len(bar_data), source="prebuilt")
+        else:
+            bar_data = self._load_bars(engine, from_date, to_date)
         funding_map = self._load_funding(engine)
 
         log.info(
             "simulation_start",
             symbol=self.symbol,
-            bars=len(bars),
+            bars=len(bar_data),
             from_date=from_date,
             to_date=to_date,
         )
@@ -239,9 +247,9 @@ class Simulator:
         last_exit_bar: int = -COOLDOWN_BARS
         unfilled_count: int = 0
 
-        for i in range(len(bars)):
-            bar = bars.iloc[i]
-            prev_bar = bars.iloc[i - 1] if i > 0 else None
+        for i in range(len(bar_data)):
+            bar = bar_data.iloc[i]
+            prev_bar = bar_data.iloc[i - 1] if i > 0 else None
             bar_ts = pd.Timestamp(bar["timestamp"])
             bar_open = float(bar["open"])
             bar_high = float(bar["high"])
@@ -324,7 +332,7 @@ class Simulator:
             unfilled_count += 1
 
         if position is not None:
-            trade = self._force_close(position, bars.iloc[-1])
+            trade = self._force_close(position, bar_data.iloc[-1])
             closed.append(trade)
 
         log.info(
@@ -402,7 +410,8 @@ class Simulator:
             tp = fill_price - order.tp_distance
 
         sl_pct = order.sl_distance / fill_price if fill_price > 0 else 0.01
-        risk_amount = self.equity * self.risk_pct
+        base_equity = self._initial_equity if self.fixed_risk else self.equity
+        risk_amount = base_equity * self.risk_pct
         position_size_usd = risk_amount / sl_pct if sl_pct > 0 else risk_amount
         position_size_usd = min(position_size_usd, self.equity * self.leverage)
 
