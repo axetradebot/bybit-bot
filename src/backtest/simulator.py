@@ -98,6 +98,7 @@ class _OpenPosition:
     entry_price: float
     stop_loss: float
     take_profit: float
+    original_stop_loss: float
     position_size_usd: float
     strategy_combo: list[str]
     indicators_snapshot: dict
@@ -108,6 +109,7 @@ class _OpenPosition:
     funding_paid_usd: float = 0.0
     fees_paid_usd: float = 0.0
     fee_rate_per_side: float = MAKER_FEE
+    be_activated: bool = False
 
 
 @dataclass
@@ -210,6 +212,7 @@ class Simulator:
         risk_pct: float = 0.02,
         equity: float = 10_000.0,
         fixed_risk: bool = False,
+        breakeven_pct: float | None = None,
     ):
         self.strategy = strategy
         self.symbol = symbol
@@ -218,6 +221,7 @@ class Simulator:
         self.equity = equity
         self._initial_equity = equity
         self.fixed_risk = fixed_risk
+        self.breakeven_pct = breakeven_pct
 
     def run(
         self,
@@ -302,8 +306,11 @@ class Simulator:
                         last_exit_bar = i
                     pending = None
 
-            # 2. Check exit for existing position
+            # 2. Check breakeven activation + exit for existing position
             if position is not None and position.entry_bar_idx < i:
+                if (self.breakeven_pct is not None
+                        and not position.be_activated):
+                    self._check_breakeven(position, bar_high, bar_low)
                 trade = self._check_exit(position, bar)
                 if trade is not None:
                     closed.append(trade)
@@ -424,6 +431,7 @@ class Simulator:
             entry_price=fill_price,
             stop_loss=sl,
             take_profit=tp,
+            original_stop_loss=sl,
             position_size_usd=position_size_usd,
             strategy_combo=order.strategy_combo,
             indicators_snapshot=order.indicators_snapshot,
@@ -436,6 +444,25 @@ class Simulator:
             fees_paid_usd=entry_fee,
             fee_rate_per_side=fee_rate,
         )
+
+    def _check_breakeven(
+        self, pos: _OpenPosition, bar_high: float, bar_low: float,
+    ) -> None:
+        """Move SL to entry (breakeven) if unrealized gain hits threshold."""
+        threshold = self.breakeven_pct
+        if threshold is None:
+            return
+        entry = pos.entry_price
+        if pos.direction == "long":
+            target = entry * (1 + threshold)
+            if bar_high >= target:
+                pos.stop_loss = entry
+                pos.be_activated = True
+        else:
+            target = entry * (1 - threshold)
+            if bar_low <= target:
+                pos.stop_loss = entry
+                pos.be_activated = True
 
     def _check_same_bar_exit(
         self, pos: _OpenPosition, bar_high: float, bar_low: float,
@@ -466,10 +493,10 @@ class Simulator:
 
         if sl_hit and tp_hit:
             exit_price = pos.stop_loss
-            exit_reason = "sl"
+            exit_reason = "be" if pos.be_activated else "sl"
         elif sl_hit:
             exit_price = pos.stop_loss
-            exit_reason = "sl"
+            exit_reason = "be" if pos.be_activated else "sl"
         else:
             exit_price = pos.take_profit
             exit_reason = "tp"

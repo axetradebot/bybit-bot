@@ -43,7 +43,7 @@ log = structlog.get_logger()
 # ── Default symbols: current live set ───────────────────────────────────
 DEFAULT_SYMBOLS = [
     "SOLUSDT", "AVAXUSDT", "WIFUSDT", "DOTUSDT",
-    "1000PEPEUSDT", "ARBUSDT",
+    "1000PEPEUSDT",
 ]
 
 TIMEFRAMES = ["15m", "4h"]
