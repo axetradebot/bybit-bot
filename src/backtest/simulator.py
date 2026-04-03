@@ -88,6 +88,9 @@ class ClosedTrade:
     regime_funding: str
     regime_time_of_day: str
     exit_reason: str
+    mfe_pct: float = 0.0
+    mae_pct: float = 0.0
+    bars_held: int = 0
     notes: str | None = None
 
 
@@ -110,6 +113,8 @@ class _OpenPosition:
     fees_paid_usd: float = 0.0
     fee_rate_per_side: float = MAKER_FEE
     be_activated: bool = False
+    mfe_pct: float = 0.0
+    mae_pct: float = 0.0
 
 
 @dataclass
@@ -308,6 +313,7 @@ class Simulator:
 
             # 2. Check breakeven activation + exit for existing position
             if position is not None and position.entry_bar_idx < i:
+                self._update_mfe_mae(position, bar_high, bar_low)
                 if (self.breakeven_pct is not None
                         and not position.be_activated):
                     self._check_breakeven(position, bar_high, bar_low)
@@ -445,6 +451,23 @@ class Simulator:
             fee_rate_per_side=fee_rate,
         )
 
+    def _update_mfe_mae(
+        self, pos: _OpenPosition, bar_high: float, bar_low: float,
+    ) -> None:
+        entry = pos.entry_price
+        if entry <= 0:
+            return
+        if pos.direction == "long":
+            fav = (bar_high - entry) / entry
+            adv = (entry - bar_low) / entry
+        else:
+            fav = (entry - bar_low) / entry
+            adv = (bar_high - entry) / entry
+        if fav > pos.mfe_pct:
+            pos.mfe_pct = fav
+        if adv > pos.mae_pct:
+            pos.mae_pct = adv
+
     def _check_breakeven(
         self, pos: _OpenPosition, bar_high: float, bar_low: float,
     ) -> None:
@@ -553,6 +576,8 @@ class Simulator:
             regime_funding=pos.regime_funding,
             regime_time_of_day=pos.regime_time_of_day,
             exit_reason=exit_reason,
+            mfe_pct=pos.mfe_pct,
+            mae_pct=pos.mae_pct,
         )
 
     def _apply_funding(

@@ -183,7 +183,7 @@ def build_combos(grid: dict, max_combos: int) -> list[dict]:
         # always include the current live defaults
         defaults = {k: grid[k][len(grid[k]) // 2] for k in keys}
         defaults.update(
-            ema_spread_min=0.003, rsi_long_lo=33, rsi_long_hi=65,
+            ema_spread_min=0.003, rsi_long_lo=38, rsi_long_hi=50,
             rsi_short_lo=32, rsi_short_hi=68, atr_rank_floor=0.25,
             sl_atr_mult=1.2, tp_atr_mult=6.0, ema_touch_slack=0.004,
         )
@@ -416,7 +416,7 @@ def main():
     # ── Comparison: current defaults vs best ────────────────────────────
     default_key = params_str({
         "atr_rank_floor": 0.25, "ema_spread_min": 0.003,
-        "ema_touch_slack": 0.004, "rsi_long_hi": 65, "rsi_long_lo": 33,
+        "ema_touch_slack": 0.004, "rsi_long_hi": 50, "rsi_long_lo": 38,
         "rsi_short_hi": 68, "rsi_short_lo": 32,
         "sl_atr_mult": 1.2, "tp_atr_mult": 6.0,
     })
