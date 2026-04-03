@@ -42,6 +42,7 @@ class TelegramNotifier:
         self._trades_session: list[dict] = []
         self._signals_session: list[dict] = []
         self._blocked_session: list[dict] = []
+        self._pending_fills: dict[str, dict] = {}
         self._lock = threading.Lock()
         self._start_time = datetime.now(timezone.utc)
 
@@ -144,13 +145,79 @@ class TelegramNotifier:
         self._send_async(msg)
 
     def notify_fill(self, symbol: str, side: str, price: float,
-                    qty: float, order_id: str) -> None:
-        msg = (
-            f"<b>Fill: {symbol}</b>\n"
-            f"Side: <code>{side}</code> | Price: <code>{price:.6g}</code>\n"
-            f"Qty: <code>{qty:.6g}</code>\n"
-            f"Order: <code>{order_id[:12]}...</code>"
-        )
+                    qty: float, order_id: str,
+                    sl: float = 0, tp: float = 0,
+                    is_close: bool = False,
+                    entry_price: float = 0,
+                    direction: str = "") -> None:
+        """Aggregate partial fills per order_id, send one message after 3s."""
+        with self._lock:
+            if order_id not in self._pending_fills:
+                self._pending_fills[order_id] = {
+                    "symbol": symbol, "side": side, "direction": direction,
+                    "total_qty": 0.0, "total_cost": 0.0,
+                    "sl": sl, "tp": tp, "is_close": is_close,
+                    "entry_price": entry_price,
+                }
+            pf = self._pending_fills[order_id]
+            pf["total_qty"] += qty
+            pf["total_cost"] += price * qty
+
+        def _delayed_send():
+            time.sleep(3)
+            with self._lock:
+                data = self._pending_fills.pop(order_id, None)
+            if not data or data["total_qty"] == 0:
+                return
+            avg_price = data["total_cost"] / data["total_qty"]
+            self._send_fill_summary(data, avg_price, order_id)
+
+        threading.Thread(target=_delayed_send, daemon=True).start()
+
+    def _send_fill_summary(self, data: dict, avg_price: float,
+                           order_id: str) -> None:
+        sym = data["symbol"]
+        side = data["side"]
+        qty = data["total_qty"]
+        direction = data["direction"]
+
+        if data["is_close"]:
+            entry = data["entry_price"]
+            if entry and entry > 0:
+                if direction == "long":
+                    pnl_pct = (avg_price - entry) / entry
+                else:
+                    pnl_pct = (entry - avg_price) / entry
+                pnl_usd = qty * avg_price * pnl_pct
+                emoji = "\u2705" if pnl_pct > 0 else "\u274C"
+                result = "TP Hit" if pnl_pct > 0 else "SL Hit"
+            else:
+                pnl_pct = 0
+                pnl_usd = 0
+                emoji = "\u2139"
+                result = "Closed"
+
+            msg = (
+                f"{emoji} <b>{result}: {sym}</b>\n"
+                f"Direction: <code>{direction.upper()}</code>\n"
+                f"Exit Price: <code>{avg_price:.6g}</code>\n"
+                f"Entry was: <code>{entry:.6g}</code>\n"
+                f"Size: <code>{qty:.6g}</code>\n"
+                f"PnL: <code>{pnl_pct:+.2%}</code>"
+            )
+            if pnl_usd:
+                msg += f" (<code>${pnl_usd:+,.2f}</code>)"
+        else:
+            arrow = "\u2B06" if side.lower() == "buy" else "\u2B07"
+            msg = (
+                f"{arrow} <b>Position Opened: {sym}</b>\n"
+                f"Direction: <code>{direction.upper() or side}</code>\n"
+                f"Entry: <code>{avg_price:.6g}</code>\n"
+                f"Size: <code>{qty:.6g}</code>\n"
+                f"SL: <code>{data['sl']:.6g}</code> | "
+                f"TP: <code>{data['tp']:.6g}</code>"
+            )
+
         self._send_async(msg)
 
     def notify_trade_closed(self, symbol: str, direction: str,

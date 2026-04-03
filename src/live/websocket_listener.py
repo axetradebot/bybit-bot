@@ -138,6 +138,7 @@ class WebSocketListener:
         self._sniper_15m: dict[str, SniperStrategy] = {}
         self._sniper_4h: dict[str, SniperStrategy] = {}
         self._sniper_tfs: list[str] = ["15m", "4h"]
+        self._last_signals: dict[str, dict] = {}
 
         self.risk_manager = RiskManager(
             is_backtest=False, risk_pct=settings.live_risk_pct,
@@ -383,13 +384,34 @@ class WebSocketListener:
     def _on_execution(self, message: dict) -> None:
         try:
             for fill in message.get("data", []):
+                symbol = fill.get("symbol", "")
+                side = fill.get("side", "")
+                order_id = fill.get("orderId", "")
+
+                tracked = self.order_manager._open_orders.get(symbol, {})
+                direction = tracked.get("direction", "")
+                entry_price = tracked.get("price", 0)
+
+                is_close = bool(tracked) and (
+                    (direction == "long" and side.lower() == "sell")
+                    or (direction == "short" and side.lower() == "buy")
+                )
+
+                signal_info = self._last_signals.get(symbol, {})
+                sl = signal_info.get("sl", 0)
+                tp = signal_info.get("tp", 0)
+
                 self.order_manager.handle_fill(fill)
                 self.telegram.notify_fill(
-                    symbol=fill.get("symbol", ""),
-                    side=fill.get("side", ""),
+                    symbol=symbol,
+                    side=side,
                     price=float(fill.get("execPrice", 0) or 0),
                     qty=float(fill.get("execQty", 0) or 0),
-                    order_id=fill.get("orderId", ""),
+                    order_id=order_id,
+                    sl=sl, tp=tp,
+                    is_close=is_close,
+                    entry_price=entry_price,
+                    direction=direction,
                 )
         except Exception as exc:
             log.error("execution_handler_error", error=str(exc))
@@ -706,6 +728,13 @@ class WebSocketListener:
             )
             return
 
+        self._last_signals[symbol] = {
+            "sl": approved.stop_loss,
+            "tp": approved.take_profit,
+            "direction": approved.direction,
+            "entry": approved.entry_price,
+        }
+
         order = self.order_manager.open_position(approved)
         log.info("sniper_executed",
                  symbol=symbol, tf=tf,
@@ -774,6 +803,13 @@ class WebSocketListener:
                         "timestamp": signal.timestamp.isoformat(),
                     })
                     continue
+
+                self._last_signals[symbol] = {
+                    "sl": approved.stop_loss,
+                    "tp": approved.take_profit,
+                    "direction": approved.direction,
+                    "entry": approved.entry_price,
+                }
 
                 order = self.order_manager.open_position(approved)
 
