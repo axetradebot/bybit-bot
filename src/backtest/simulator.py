@@ -113,6 +113,8 @@ class _OpenPosition:
     fees_paid_usd: float = 0.0
     fee_rate_per_side: float = MAKER_FEE
     be_activated: bool = False
+    trail_activated: bool = False
+    high_watermark: float = 0.0
     mfe_pct: float = 0.0
     mae_pct: float = 0.0
 
@@ -227,6 +229,8 @@ class Simulator:
         self._initial_equity = equity
         self.fixed_risk = fixed_risk
         self.breakeven_pct = breakeven_pct
+        self.trail_after_pct: float | None = None
+        self.trail_offset_pct: float = 0.0
 
     def run(
         self,
@@ -311,12 +315,14 @@ class Simulator:
                         last_exit_bar = i
                     pending = None
 
-            # 2. Check breakeven activation + exit for existing position
+            # 2. Check breakeven/trailing activation + exit for existing position
             if position is not None and position.entry_bar_idx < i:
                 self._update_mfe_mae(position, bar_high, bar_low)
                 if (self.breakeven_pct is not None
                         and not position.be_activated):
                     self._check_breakeven(position, bar_high, bar_low)
+                if self.trail_after_pct is not None:
+                    self._check_trailing(position, bar_high, bar_low)
                 trade = self._check_exit(position, bar)
                 if trade is not None:
                     closed.append(trade)
@@ -487,6 +493,37 @@ class Simulator:
                 pos.stop_loss = entry
                 pos.be_activated = True
 
+    def _check_trailing(
+        self, pos: _OpenPosition, bar_high: float, bar_low: float,
+    ) -> None:
+        """Trailing stop: once unrealized gain hits trail_after_pct, trail SL behind HWM."""
+        threshold = self.trail_after_pct
+        if threshold is None:
+            return
+        entry = pos.entry_price
+        offset = self.trail_offset_pct
+
+        if pos.direction == "long":
+            gain = (bar_high - entry) / entry
+            if gain >= threshold:
+                pos.trail_activated = True
+            if pos.trail_activated:
+                if bar_high > pos.high_watermark:
+                    pos.high_watermark = bar_high
+                new_sl = pos.high_watermark * (1 - offset)
+                if new_sl > pos.stop_loss:
+                    pos.stop_loss = new_sl
+        else:
+            gain = (entry - bar_low) / entry
+            if gain >= threshold:
+                pos.trail_activated = True
+            if pos.trail_activated:
+                if pos.high_watermark == 0 or bar_low < pos.high_watermark:
+                    pos.high_watermark = bar_low
+                new_sl = pos.high_watermark * (1 + offset)
+                if new_sl < pos.stop_loss:
+                    pos.stop_loss = new_sl
+
     def _check_same_bar_exit(
         self, pos: _OpenPosition, bar_high: float, bar_low: float,
     ) -> float | None:
@@ -516,10 +553,12 @@ class Simulator:
 
         if sl_hit and tp_hit:
             exit_price = pos.stop_loss
-            exit_reason = "be" if pos.be_activated else "sl"
+            exit_reason = ("trail" if pos.trail_activated
+                           else "be" if pos.be_activated else "sl")
         elif sl_hit:
             exit_price = pos.stop_loss
-            exit_reason = "be" if pos.be_activated else "sl"
+            exit_reason = ("trail" if pos.trail_activated
+                           else "be" if pos.be_activated else "sl")
         else:
             exit_price = pos.take_profit
             exit_reason = "tp"

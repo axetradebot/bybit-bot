@@ -213,6 +213,41 @@ class OrderManager:
                  amount=amount)
         return order
 
+    def update_stop_loss(self, symbol: str, new_sl: float) -> bool:
+        """Move the stop-loss for an open position on Bybit."""
+        if self._exchange is None:
+            return False
+        ccxt_sym = _to_ccxt_symbol(symbol)
+        try:
+            new_sl_str = str(
+                float(self._exchange.price_to_precision(ccxt_sym, new_sl))
+            )
+        except Exception:
+            new_sl_str = str(new_sl)
+        try:
+            self._exchange.set_trading_stop(ccxt_sym, params={
+                "stopLoss": new_sl_str,
+                "slTriggerBy": "MarkPrice",
+                "positionIdx": 0,
+            })
+            log.info("stop_loss_updated", symbol=symbol, new_sl=new_sl_str)
+            return True
+        except AttributeError:
+            pass
+        try:
+            self._exchange.private_post_v5_position_trading_stop({
+                "category": "linear",
+                "symbol": symbol,
+                "stopLoss": new_sl_str,
+                "slTriggerBy": "MarkPrice",
+                "positionIdx": 0,
+            })
+            log.info("stop_loss_updated", symbol=symbol, new_sl=new_sl_str)
+            return True
+        except Exception as exc:
+            log.error("update_sl_failed", symbol=symbol, error=str(exc))
+            return False
+
     def close_position(self, symbol: str, reason: str) -> dict | None:
         """Cancel open TP/SL orders and market-close the position."""
         if self._exchange is None:

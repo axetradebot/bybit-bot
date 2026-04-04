@@ -140,6 +140,10 @@ class WebSocketListener:
         self._sniper_tfs: list[str] = ["15m", "4h"]
         self._last_signals: dict[str, dict] = {}
 
+        self._trail_activate = settings.trail_activate_pct
+        self._trail_offset = settings.trail_offset_pct
+        self._trail_state: dict[str, dict] = {}
+
         self.risk_manager = RiskManager(
             is_backtest=False, risk_pct=settings.live_risk_pct,
         )
@@ -406,7 +410,9 @@ class WebSocketListener:
                 self._latest_funding[symbol] = float(fr)
             mp = data.get("markPrice")
             if mp:
-                self._latest_mark[symbol] = float(mp)
+                mark = float(mp)
+                self._latest_mark[symbol] = mark
+                self._check_trailing_stop(symbol, mark)
         except Exception as exc:
             log.error("ticker_handler_error", error=str(exc))
 
@@ -431,6 +437,8 @@ class WebSocketListener:
                 tp = signal_info.get("tp", 0)
 
                 self.order_manager.handle_fill(fill)
+                if is_close:
+                    self._unregister_trailing(symbol)
                 self.telegram.notify_fill(
                     symbol=symbol,
                     side=side,
@@ -769,6 +777,10 @@ class WebSocketListener:
                  symbol=symbol, tf=tf,
                  direction=approved.direction)
         if order:
+            self._register_trailing(
+                symbol, approved.direction,
+                approved.entry_price, approved.stop_loss,
+            )
             self.telegram.notify_order_placed(
                 symbol=symbol, direction=approved.direction,
                 side=order.get("side", ""),
@@ -776,6 +788,77 @@ class WebSocketListener:
                 amount=float(order.get("amount", 0)),
                 order_id=order.get("id", ""),
             )
+
+    # ----- trailing stop management -------------------------------------
+
+    def _register_trailing(
+        self, symbol: str, direction: str,
+        entry_price: float, original_sl: float,
+    ) -> None:
+        self._trail_state[symbol] = {
+            "direction": direction,
+            "entry": entry_price,
+            "original_sl": original_sl,
+            "hwm": entry_price,
+            "activated": False,
+            "current_sl": original_sl,
+        }
+        log.info("trail_registered",
+                 symbol=symbol, direction=direction,
+                 entry=entry_price, activate_at=f"{self._trail_activate:.0%}")
+
+    def _check_trailing_stop(self, symbol: str, mark_price: float) -> None:
+        ts = self._trail_state.get(symbol)
+        if ts is None:
+            return
+
+        entry = ts["entry"]
+        direction = ts["direction"]
+
+        if direction == "long":
+            gain_pct = (mark_price - entry) / entry
+        else:
+            gain_pct = (entry - mark_price) / entry
+
+        if gain_pct < 0:
+            return
+
+        if not ts["activated"] and gain_pct >= self._trail_activate:
+            ts["activated"] = True
+            ts["hwm"] = mark_price
+            log.info("trail_activated",
+                     symbol=symbol, gain_pct=f"{gain_pct:.2%}",
+                     mark=mark_price)
+
+        if not ts["activated"]:
+            return
+
+        if direction == "long":
+            if mark_price > ts["hwm"]:
+                ts["hwm"] = mark_price
+            new_sl = ts["hwm"] * (1 - self._trail_offset)
+            if new_sl > ts["current_sl"]:
+                ok = self.order_manager.update_stop_loss(symbol, new_sl)
+                if ok:
+                    ts["current_sl"] = new_sl
+                    log.info("trail_sl_moved",
+                             symbol=symbol, new_sl=new_sl,
+                             hwm=ts["hwm"], gain=f"{gain_pct:.2%}")
+        else:
+            if mark_price < ts["hwm"]:
+                ts["hwm"] = mark_price
+            new_sl = ts["hwm"] * (1 + self._trail_offset)
+            if new_sl < ts["current_sl"]:
+                ok = self.order_manager.update_stop_loss(symbol, new_sl)
+                if ok:
+                    ts["current_sl"] = new_sl
+                    log.info("trail_sl_moved",
+                             symbol=symbol, new_sl=new_sl,
+                             hwm=ts["hwm"], gain=f"{gain_pct:.2%}")
+
+    def _unregister_trailing(self, symbol: str) -> None:
+        if symbol in self._trail_state:
+            del self._trail_state[symbol]
 
     # ----- strategy pipeline --------------------------------------------
 
@@ -847,6 +930,10 @@ class WebSocketListener:
                          strategy=strategy.name,
                          direction=approved.direction)
                 if order:
+                    self._register_trailing(
+                        symbol, approved.direction,
+                        approved.entry_price, approved.stop_loss,
+                    )
                     self.telegram.notify_order_placed(
                         symbol=symbol, direction=approved.direction,
                         side=order.get("side", ""),
@@ -885,6 +972,13 @@ class WebSocketListener:
             return {"status": "blocked", "reason": "risk_manager"}
 
         order = self.order_manager.open_position(approved)
+        if order:
+            self._register_trailing(
+                symbol=approved.symbol,
+                direction=approved.direction,
+                entry_price=approved.entry_price,
+                original_sl=approved.stop_loss,
+            )
         return {
             "status": "executed",
             "order_id": order["id"] if order else None,
@@ -907,11 +1001,26 @@ def main() -> None:
     ws_thread = threading.Thread(target=listener.start, daemon=True)
     ws_thread.start()
 
-    # background position-sync every 60 s
     def _sync_loop() -> None:
         while True:
             try:
-                listener.order_manager.sync_positions()
+                positions = listener.order_manager.sync_positions()
+                for pos in positions:
+                    sym = pos.get("symbol", "")
+                    if sym and sym not in listener._trail_state:
+                        side = pos.get("side", "")
+                        entry = pos.get("entryPrice", 0)
+                        if side and entry > 0:
+                            direction = "long" if side == "long" else "short"
+                            if direction == "long":
+                                orig_sl = entry * (1 - 0.02)
+                            else:
+                                orig_sl = entry * (1 + 0.02)
+                            listener._register_trailing(
+                                sym, direction, entry, orig_sl)
+                            log.info("trail_synced_from_position",
+                                     symbol=sym, direction=direction,
+                                     entry=entry)
             except Exception:
                 pass
             time.sleep(60)
