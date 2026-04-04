@@ -144,7 +144,7 @@ class WebSocketListener:
             is_backtest=False, risk_pct=settings.live_risk_pct,
         )
         self.order_manager = OrderManager(engine)
-        self._equity = settings.live_equity
+        self._equity = self._fetch_live_equity() or settings.live_equity
         self.telegram = TelegramNotifier()
 
         log.info("listener_initialized",
@@ -178,6 +178,21 @@ class WebSocketListener:
         self.telegram.start_hourly_loop(exchange=exchange)
 
     # ----- initialisation -----------------------------------------------
+
+    def _fetch_live_equity(self) -> float | None:
+        """Query Bybit for total USDT equity so position sizing uses the real balance."""
+        exchange = self.order_manager._exchange
+        if exchange is None:
+            return None
+        try:
+            balance = exchange.fetch_balance({"accountType": "UNIFIED"})
+            total = float(balance.get("total", {}).get("USDT", 0) or 0)
+            if total > 0:
+                log.info("live_equity_fetched", equity=total)
+                return total
+        except Exception as exc:
+            log.warning("live_equity_fetch_failed", error=str(exc))
+        return None
 
     def _init_buffer(self, symbol: str) -> None:
         """Pre-fill bar buffer from DB, falling back to Bybit REST API."""

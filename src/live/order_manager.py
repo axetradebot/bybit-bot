@@ -140,6 +140,14 @@ class OrderManager:
 
         ccxt_sym = _to_ccxt_symbol(signal.symbol)
 
+        leverage = signal.leverage or 10
+        try:
+            self._exchange.set_leverage(leverage, ccxt_sym)
+            log.info("leverage_set", symbol=signal.symbol, leverage=leverage)
+        except Exception as exc:
+            log.warning("set_leverage_failed", symbol=signal.symbol,
+                        leverage=leverage, error=str(exc))
+
         try:
             ticker = self._exchange.fetch_ticker(ccxt_sym)
         except Exception as exc:
