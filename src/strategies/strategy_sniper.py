@@ -17,7 +17,7 @@ Confluence gates (all must pass):
   Trading TF  -- Full EMA stack (9 > 21 > 50)
               -- EMA spread > 0.3 %  (trend well-established)
               -- EMA-21 rejection candle
-              -- RSI 38-50 (long) / 32-68 (short)  (tight long filter)
+              -- RSI 33-65 (long) / 32-68 (short)  (healthy pullback)
               -- Heikin-Ashi reversal candle
               -- Supertrend direction
               -- ATR-rank >= 0.25
@@ -45,8 +45,8 @@ class SniperStrategy(BaseStrategy):
         self,
         *,
         ema_spread_min: float = 0.003,
-        rsi_long_lo: float = 38,
-        rsi_long_hi: float = 50,
+        rsi_long_lo: float = 33,
+        rsi_long_hi: float = 65,
         rsi_short_lo: float = 32,
         rsi_short_hi: float = 68,
         atr_rank_floor: float = 0.25,
