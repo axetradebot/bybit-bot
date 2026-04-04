@@ -180,16 +180,30 @@ class WebSocketListener:
     # ----- initialisation -----------------------------------------------
 
     def _fetch_live_equity(self) -> float | None:
-        """Query Bybit for total USDT equity so position sizing uses the real balance."""
+        """Query Bybit for total margin balance so position sizing uses the real equity."""
         exchange = self.order_manager._exchange
         if exchange is None:
             return None
         try:
             balance = exchange.fetch_balance({"accountType": "UNIFIED"})
-            total = float(balance.get("total", {}).get("USDT", 0) or 0)
-            if total > 0:
-                log.info("live_equity_fetched", equity=total)
-                return total
+            info = balance.get("info", {})
+            result = info.get("result", {})
+            account_list = result.get("list", [])
+            if account_list:
+                acct = account_list[0]
+                total_equity = float(acct.get("totalEquity", 0) or 0)
+                margin_balance = float(acct.get("totalMarginBalance", 0) or 0)
+                equity = total_equity or margin_balance
+                if equity > 0:
+                    log.info("live_equity_fetched",
+                             total_equity=total_equity,
+                             margin_balance=margin_balance,
+                             using=equity)
+                    return equity
+            fallback = float(balance.get("total", {}).get("USDT", 0) or 0)
+            if fallback > 0:
+                log.info("live_equity_fetched", fallback=fallback)
+                return fallback
         except Exception as exc:
             log.warning("live_equity_fetch_failed", error=str(exc))
         return None
