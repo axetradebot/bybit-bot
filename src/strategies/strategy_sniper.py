@@ -192,7 +192,7 @@ class SniperStrategy(BaseStrategy):
             entry_price=close,
             stop_loss=sl,
             take_profit=tp,
-            leverage=10,
+            leverage=20,
             indicators_snapshot=build_indicator_snapshot(c),
             strategy_combo=["sniper", "ema_rejection", "multi_tf"],
             regime=regime,

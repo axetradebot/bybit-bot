@@ -140,10 +140,16 @@ class OrderManager:
 
         ccxt_sym = _to_ccxt_symbol(signal.symbol)
 
-        leverage = signal.leverage or 10
+        leverage = signal.leverage or 20
+        try:
+            self._exchange.set_margin_mode("isolated", ccxt_sym)
+        except Exception as exc:
+            log.warning("set_margin_mode_failed", symbol=signal.symbol,
+                        error=str(exc))
         try:
             self._exchange.set_leverage(leverage, ccxt_sym)
-            log.info("leverage_set", symbol=signal.symbol, leverage=leverage)
+            log.info("leverage_set", symbol=signal.symbol,
+                     leverage=leverage, margin="isolated")
         except Exception as exc:
             log.warning("set_leverage_failed", symbol=signal.symbol,
                         leverage=leverage, error=str(exc))

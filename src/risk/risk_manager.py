@@ -221,7 +221,7 @@ class RiskManager:
         position_size_usd = size_base * entry
 
         leverage = signal.leverage or 10
-        max_notional = account_equity * leverage * 0.25
+        max_notional = account_equity * leverage * 0.40
         if position_size_usd > max_notional:
             position_size_usd = max_notional
 
