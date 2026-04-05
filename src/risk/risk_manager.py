@@ -220,8 +220,8 @@ class RiskManager:
         size_base = risk_amount / (risk_dist + entry * round_trip_cost_rate)
         position_size_usd = size_base * entry
 
-        leverage = signal.leverage or 10
-        max_notional = account_equity * leverage * 0.40
+        leverage = signal.leverage or 20
+        max_notional = account_equity * leverage * 0.15
         if position_size_usd > max_notional:
             position_size_usd = max_notional
 
