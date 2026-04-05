@@ -23,7 +23,7 @@ class Settings(BaseSettings):
 
     live_strategy: str = Field("all", env="LIVE_STRATEGY")
     live_equity: float = Field(1_000.0, env="LIVE_EQUITY")
-    live_risk_pct: float = Field(0.02, env="LIVE_RISK_PCT")
+    live_risk_pct: float = Field(0.01, env="LIVE_RISK_PCT")
 
     trail_activate_pct: float = Field(0.10, env="TRAIL_ACTIVATE_PCT")
     trail_offset_pct: float = Field(0.03, env="TRAIL_OFFSET_PCT")

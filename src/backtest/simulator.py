@@ -219,7 +219,7 @@ class Simulator:
         strategy: Strategy,
         symbol: str,
         leverage: int = 10,
-        risk_pct: float = 0.02,
+        risk_pct: float = 0.01,
         equity: float = 10_000.0,
         fixed_risk: bool = False,
         breakeven_pct: float | None = None,
