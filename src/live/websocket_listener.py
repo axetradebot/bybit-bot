@@ -149,6 +149,7 @@ class WebSocketListener:
         )
         self.order_manager = OrderManager(engine)
         self._equity = self._fetch_live_equity() or settings.live_equity
+        self._equity_last_refresh = time.time()
         self.telegram = TelegramNotifier()
 
         log.info("listener_initialized",
@@ -182,6 +183,15 @@ class WebSocketListener:
         self.telegram.start_hourly_loop(exchange=exchange)
 
     # ----- initialisation -----------------------------------------------
+
+    def _refresh_equity_if_stale(self, max_age_s: int = 300) -> None:
+        """Re-fetch equity from Bybit if the cached value is older than max_age_s."""
+        if time.time() - self._equity_last_refresh < max_age_s:
+            return
+        fresh = self._fetch_live_equity()
+        if fresh and fresh > 0:
+            self._equity = fresh
+            self._equity_last_refresh = time.time()
 
     def _fetch_live_equity(self) -> float | None:
         """Query Bybit for total margin balance so position sizing uses the real equity."""
@@ -887,6 +897,7 @@ class WebSocketListener:
                 if signal is None or signal.direction == "flat":
                     continue
 
+                self._refresh_equity_if_stale()
                 positions = self.order_manager.sync_positions()
                 daily_pnl = self.order_manager.get_daily_pnl()
                 predicted = self._predicted_funding.get(symbol, funding)
