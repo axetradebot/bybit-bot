@@ -937,8 +937,8 @@ class WebSocketListener:
                     self.telegram.notify_order_placed(
                         symbol=symbol, direction=approved.direction,
                         side=order.get("side", ""),
-                        price=float(order.get("price", 0)),
-                        amount=float(order.get("amount", 0)),
+                        price=float(order.get("price") or 0),
+                        amount=float(order.get("amount") or 0),
                         order_id=order.get("id", ""),
                     )
 

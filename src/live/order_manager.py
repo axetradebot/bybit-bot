@@ -388,7 +388,7 @@ class OrderManager:
                     direction=signal.direction,
                     leverage=signal.leverage,
                     entry_time=signal.timestamp,
-                    entry_price=float(order.get("price", signal.entry_price)),
+                    entry_price=float(order.get("price") or signal.entry_price),
                     stop_loss=signal.stop_loss,
                     take_profit=signal.take_profit,
                     position_size_usd=signal.position_size_usd or 0,

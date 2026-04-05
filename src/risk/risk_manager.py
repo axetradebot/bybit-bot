@@ -192,11 +192,11 @@ class RiskManager:
                 pass
 
         if total_trades >= 300 and win_rate >= 0.62:
-            max_lev = 20
+            max_lev = 25
         elif total_trades >= 100 and win_rate >= 0.58:
-            max_lev = 15
+            max_lev = 20
         else:
-            max_lev = 10
+            max_lev = 20
 
         max_lev = min(max_lev, 25)
         signal.leverage = min(signal.leverage, max_lev)
