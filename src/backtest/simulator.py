@@ -41,6 +41,9 @@ INDICATOR_COLS = [
     "obv", "volume_delta", "order_flow_imb",
     "ha_open", "ha_high", "ha_low", "ha_close",
     "funding_8h", "funding_24h_cum", "liq_volume_1h",
+    "adx_14", "plus_di", "minus_di",
+    "cmf_20", "willr_14", "roc_10",
+    "candle_body_ratio", "volume_ratio", "vwma_20", "obv_slope",
     "extras",
 ]
 

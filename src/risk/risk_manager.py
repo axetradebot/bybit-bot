@@ -211,10 +211,20 @@ class RiskManager:
         if risk_dist <= 0:
             return True
 
-        size_base = (account_equity * self.risk_pct) / risk_dist
+        MAKER_FEE = 0.0002
+        TAKER_FEE = 0.00055
+        SLIPPAGE_BPS = 0.0003
+        round_trip_cost_rate = MAKER_FEE + TAKER_FEE + SLIPPAGE_BPS
+
+        risk_amount = account_equity * self.risk_pct
+        size_base = risk_amount / (risk_dist + entry * round_trip_cost_rate)
         position_size_usd = size_base * entry
 
-        leverage = signal.leverage
+        leverage = signal.leverage or 10
+        max_notional = account_equity * leverage * 0.40
+        if position_size_usd > max_notional:
+            position_size_usd = max_notional
+
         atr = _sf(signal.indicators_snapshot.get("atr_14"))
 
         if leverage > 0 and atr > 0:

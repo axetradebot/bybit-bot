@@ -65,6 +65,12 @@ TA_COL_MAP: dict[str, str] = {
     "ATRr_14": "atr_14",
     "VWAP_D": "vwap",
     "OBV": "obv",
+    "ADX_14": "adx_14",
+    "DMP_14": "plus_di",
+    "DMN_14": "minus_di",
+    "CMF_20": "cmf_20",
+    "WILLR_14": "willr_14",
+    "ROC_10": "roc_10",
 }
 
 DERIVED_FLOAT_COLS = [
@@ -75,6 +81,7 @@ DERIVED_FLOAT_COLS = [
     "ha_open", "ha_high", "ha_low", "ha_close",
     "funding_8h", "funding_24h_cum", "liq_volume_1h",
     "volume_delta",
+    "candle_body_ratio", "volume_ratio", "vwma_20", "obv_slope",
 ]
 
 DIV_COLS = [
@@ -248,6 +255,11 @@ def compute_ta_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     df.ta.obv(append=True)
 
+    df.ta.adx(length=14, append=True)
+    df.ta.cmf(length=20, append=True)
+    df.ta.willr(length=14, append=True)
+    df.ta.roc(length=10, append=True)
+
     df = df.reset_index()
     return df
 
@@ -297,6 +309,19 @@ def compute_derived(df: pd.DataFrame) -> pd.DataFrame:
     )
     df["ha_high"] = df[["high", "ha_open", "ha_close"]].max(axis=1)
     df["ha_low"] = df[["low", "ha_open", "ha_close"]].min(axis=1)
+
+    hl_range = (df["high"] - df["low"]).replace(0, np.nan)
+    df["candle_body_ratio"] = (df["close"] - df["open"]).abs() / hl_range
+
+    vol_sma = df["volume"].rolling(20, min_periods=1).mean().replace(0, np.nan)
+    df["volume_ratio"] = df["volume"] / vol_sma
+
+    vwma_num = (df["close"] * df["volume"]).rolling(20, min_periods=1).sum()
+    vwma_den = df["volume"].rolling(20, min_periods=1).sum().replace(0, np.nan)
+    df["vwma_20"] = vwma_num / vwma_den
+
+    obv = _col(df, "OBV")
+    df["obv_slope"] = obv - obv.shift(5)
 
     return df
 
