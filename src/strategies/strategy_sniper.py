@@ -51,7 +51,7 @@ class SniperStrategy(BaseStrategy):
         rsi_short_hi: float = 68,
         atr_rank_floor: float = 0.25,
         sl_atr_mult: float = 1.2,
-        tp_atr_mult: float = 6.0,
+        tp_atr_mult: float = 6.5,
         ema_touch_slack: float = 0.004,
     ):
         self.ema_spread_min = ema_spread_min
