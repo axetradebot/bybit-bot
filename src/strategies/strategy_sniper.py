@@ -22,7 +22,7 @@ Confluence gates (all must pass):
               -- Supertrend direction
               -- ATR-rank >= 0.25
 
-Risk: SL = sl_atr_mult * ATR,  TP = tp_atr_mult * ATR  (default 5:1 R:R).
+Risk: SL = sl_atr_mult * ATR,  TP = tp_atr_mult * ATR  (default 5.4:1 R:R).
 Fill: limit order (maker fees).
 
 All numeric thresholds are configurable via __init__ kwargs so the
@@ -50,8 +50,8 @@ class SniperStrategy(BaseStrategy):
         rsi_short_lo: float = 32,
         rsi_short_hi: float = 68,
         atr_rank_floor: float = 0.25,
-        sl_atr_mult: float = 1.2,
-        tp_atr_mult: float = 6.5,
+        sl_atr_mult: float = 1.8,
+        tp_atr_mult: float = 9.7,
         ema_touch_slack: float = 0.004,
     ):
         self.ema_spread_min = ema_spread_min
