@@ -67,6 +67,42 @@ log = structlog.get_logger()
 
 # Minimum buffer length before we start running indicators / strategies
 _MIN_BUFFER = 20
+
+# ---------------------------------------------------------------------------
+# Anti-chop filter — blocks signals in low-quality / choppy conditions.
+# Sim-validated: DI aligned + BB mid side + volume >= 1.2x + no BB squeeze.
+# ---------------------------------------------------------------------------
+_CHOP_FILTER_VOL_FLOOR = 1.2
+
+
+def _passes_chop_filter(bar: pd.Series, direction: str) -> tuple[bool, str]:
+    """Return (passes, reason) — reason is empty when it passes."""
+    plus_di = _sf(bar.get("plus_di"))
+    minus_di = _sf(bar.get("minus_di"))
+    if plus_di > 0 or minus_di > 0:
+        if direction == "long" and plus_di <= minus_di:
+            return False, "chop_filter:di_not_aligned"
+        if direction == "short" and minus_di <= plus_di:
+            return False, "chop_filter:di_not_aligned"
+
+    bb_mid = _sf(bar.get("bb_mid"))
+    close = _sf(bar.get("close"))
+    if bb_mid > 0 and close > 0:
+        if direction == "long" and close <= bb_mid:
+            return False, "chop_filter:wrong_side_bb_mid"
+        if direction == "short" and close >= bb_mid:
+            return False, "chop_filter:wrong_side_bb_mid"
+
+    vol_ratio = _sf(bar.get("volume_ratio"))
+    if vol_ratio > 0 and vol_ratio < _CHOP_FILTER_VOL_FLOOR:
+        return False, "chop_filter:low_volume"
+
+    if bar.get("bb_squeeze", False):
+        return False, "chop_filter:bb_squeeze"
+
+    return True, ""
+
+
 # Bars to keep in memory per symbol (5000 = ~17 days of 5m bars, enough for 4h indicators)
 _BUFFER_SIZE = 5000
 
@@ -728,6 +764,24 @@ class WebSocketListener:
             log.info("sniper_eval", symbol=symbol, tf=tf, result="flat")
             return
 
+        passes, chop_reason = _passes_chop_filter(trading_row, signal.direction)
+        if not passes:
+            log.info("sniper_chop_filtered",
+                     symbol=symbol, tf=tf,
+                     direction=signal.direction, reason=chop_reason)
+            self.state.add_blocked({
+                "symbol": symbol,
+                "strategy": f"sniper_{tf}",
+                "direction": signal.direction,
+                "reason": chop_reason,
+                "timestamp": signal.timestamp.isoformat(),
+            })
+            self.telegram.notify_blocked(
+                symbol=symbol, strategy=f"sniper_{tf}",
+                direction=signal.direction, reason=chop_reason,
+            )
+            return
+
         log.info("sniper_signal",
                  symbol=symbol, tf=tf,
                  direction=signal.direction,
@@ -895,6 +949,20 @@ class WebSocketListener:
                 )
 
                 if signal is None or signal.direction == "flat":
+                    continue
+
+                passes, chop_reason = _passes_chop_filter(ind_5m, signal.direction)
+                if not passes:
+                    log.info("strategy_chop_filtered",
+                             symbol=symbol, strategy=strategy.name,
+                             direction=signal.direction, reason=chop_reason)
+                    self.state.add_blocked({
+                        "symbol": symbol,
+                        "strategy": strategy.name,
+                        "direction": signal.direction,
+                        "reason": chop_reason,
+                        "timestamp": signal.timestamp.isoformat(),
+                    })
                     continue
 
                 self._refresh_equity_if_stale()
