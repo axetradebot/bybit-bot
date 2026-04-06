@@ -35,6 +35,10 @@ class RiskManager:
     to know if the funding gate is firing constantly.
     """
 
+    TREND_BOOST_RISK = 0.0125
+    TREND_REDUCE_RISK = 0.0075
+    EMA_NEUTRAL_BAND = 0.001
+
     def __init__(self, is_backtest: bool = True, risk_pct: float = 0.01):
         self.is_backtest = is_backtest
         self.risk_pct = risk_pct
@@ -201,6 +205,29 @@ class RiskManager:
         max_lev = min(max_lev, 25)
         signal.leverage = min(signal.leverage, max_lev)
 
+    def _ema_trend_risk(self, signal: SignalEvent) -> float:
+        """Adjust risk based on EMA 50/200 trend alignment."""
+        ema50 = _sf(signal.indicators_snapshot.get("ema_50"))
+        ema200 = _sf(signal.indicators_snapshot.get("ema_200"))
+        if ema50 <= 0 or ema200 <= 0:
+            return self.risk_pct
+
+        spread = (ema50 - ema200) / ema200
+        if abs(spread) <= self.EMA_NEUTRAL_BAND:
+            return self.risk_pct
+
+        bullish = spread > 0
+        with_trend = ((signal.direction == "long" and bullish) or
+                      (signal.direction == "short" and not bullish))
+
+        chosen = self.TREND_BOOST_RISK if with_trend else self.TREND_REDUCE_RISK
+        log.debug("ema_trend_risk",
+                  symbol=signal.symbol, direction=signal.direction,
+                  ema50=round(ema50, 6), ema200=round(ema200, 6),
+                  trend="bull" if bullish else "bear",
+                  aligned=with_trend, risk_pct=chosen)
+        return chosen
+
     def _position_size_gate(
         self, signal: SignalEvent, account_equity: float,
     ) -> bool:
@@ -216,7 +243,8 @@ class RiskManager:
         SLIPPAGE_BPS = 0.0003
         round_trip_cost_rate = MAKER_FEE + TAKER_FEE + SLIPPAGE_BPS
 
-        risk_amount = account_equity * self.risk_pct
+        effective_risk = self._ema_trend_risk(signal)
+        risk_amount = account_equity * effective_risk
         size_base = risk_amount / (risk_dist + entry * round_trip_cost_rate)
         position_size_usd = size_base * entry
 
