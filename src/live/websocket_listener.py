@@ -70,13 +70,19 @@ _MIN_BUFFER = 20
 
 # ---------------------------------------------------------------------------
 # Anti-chop filter — blocks signals in low-quality / choppy conditions.
-# Sim-validated: DI aligned + BB mid side + volume >= 1.2x + no BB squeeze.
+# Bear-market-optimised: ADX>=25 + DI aligned + BB mid side + volume >= 2.0x.
+# Profitable in both 2023 bear and late-2025/2026 crash windows.
 # ---------------------------------------------------------------------------
-_CHOP_FILTER_VOL_FLOOR = 1.2
+_CHOP_FILTER_ADX_FLOOR = 25
+_CHOP_FILTER_VOL_FLOOR = 2.0
 
 
 def _passes_chop_filter(bar: pd.Series, direction: str) -> tuple[bool, str]:
     """Return (passes, reason) — reason is empty when it passes."""
+    adx = _sf(bar.get("adx_14"))
+    if adx > 0 and adx < _CHOP_FILTER_ADX_FLOOR:
+        return False, "chop_filter:adx_too_low"
+
     plus_di = _sf(bar.get("plus_di"))
     minus_di = _sf(bar.get("minus_di"))
     if plus_di > 0 or minus_di > 0:
@@ -96,9 +102,6 @@ def _passes_chop_filter(bar: pd.Series, direction: str) -> tuple[bool, str]:
     vol_ratio = _sf(bar.get("volume_ratio"))
     if vol_ratio > 0 and vol_ratio < _CHOP_FILTER_VOL_FLOOR:
         return False, "chop_filter:low_volume"
-
-    if bar.get("bb_squeeze", False):
-        return False, "chop_filter:bb_squeeze"
 
     return True, ""
 
