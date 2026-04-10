@@ -25,7 +25,7 @@ class RSIDivergenceStrategy(BaseStrategy):
     name = "rsi_divergence"
 
     def __init__(self):
-        self._history: deque[dict] = deque(maxlen=12)
+        self._history: dict[str, deque[dict]] = {}
 
     def _snap(self, row: pd.Series) -> dict:
         return {
@@ -45,9 +45,11 @@ class RSIDivergenceStrategy(BaseStrategy):
     ) -> SignalEvent | None:
         curr = indicators_5m
         snap = self._snap(curr)
-        self._history.append(snap)
+        if symbol not in self._history:
+            self._history[symbol] = deque(maxlen=12)
+        self._history[symbol].append(snap)
 
-        if len(self._history) < 4:
+        if len(self._history[symbol]) < 4:
             return None
 
         extras = curr.get("extras", {})
@@ -68,11 +70,12 @@ class RSIDivergenceStrategy(BaseStrategy):
             return None
 
         # Supertrend flip within last 3 bars
+        hist = self._history[symbol]
         curr_st = snap["supertrend_dir"]
         bull_flip = False
         bear_flip = False
-        for lookback in range(1, min(4, len(self._history))):
-            prev_st = self._history[-(lookback + 1)]["supertrend_dir"]
+        for lookback in range(1, min(4, len(hist))):
+            prev_st = hist[-(lookback + 1)]["supertrend_dir"]
             if curr_st > 0 and prev_st < 0:
                 bull_flip = True
             if curr_st < 0 and prev_st > 0:
@@ -80,8 +83,8 @@ class RSIDivergenceStrategy(BaseStrategy):
 
         # EMA_50 slope
         ema50_now = snap["ema_50"]
-        ema50_3ago = (self._history[-4]["ema_50"]
-                      if len(self._history) >= 4 else ema50_now)
+        ema50_3ago = (hist[-4]["ema_50"]
+                      if len(hist) >= 4 else ema50_now)
         ema_slope_up = ema50_now > ema50_3ago
         ema_slope_dn = ema50_now < ema50_3ago
 
@@ -93,7 +96,7 @@ class RSIDivergenceStrategy(BaseStrategy):
         if atr <= 0 or not _valid(curr.get("rsi_14")):
             return None
 
-        window = list(self._history)[-10:]
+        window = list(hist)[-10:]
         swing_low = min(h["low"] for h in window)
         swing_high = max(h["high"] for h in window)
 
@@ -152,7 +155,7 @@ class RSIDivergenceStrategy(BaseStrategy):
             entry_price=close,
             stop_loss=sl,
             take_profit=tp,
-            leverage=10,
+            leverage=20,
             indicators_snapshot=build_indicator_snapshot(curr),
             strategy_combo=["rsi_div", "supertrend_flip", "ema_slope"],
             regime=regime,

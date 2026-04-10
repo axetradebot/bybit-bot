@@ -89,7 +89,7 @@ class VWAPReversionStrategy(BaseStrategy):
             entry_price=close,
             stop_loss=sl,
             take_profit=tp,
-            leverage=10,
+            leverage=20,
             indicators_snapshot=build_indicator_snapshot(c),
             strategy_combo=["vwap_reversion", "rsi_filter", "atr_regime",
                             "funding_neutral"],

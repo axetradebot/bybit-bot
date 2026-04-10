@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     breakeven_activate_pct: float = Field(0.20, env="BREAKEVEN_ACTIVATE_PCT")
     trail_activate_pct: float = Field(0.20, env="TRAIL_ACTIVATE_PCT")
     trail_offset_pct: float = Field(0.03, env="TRAIL_OFFSET_PCT")
+    max_hold_hours: int = Field(24, env="MAX_HOLD_HOURS")
 
     telegram_bot_token: str = Field("", env="TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str = Field("", env="TELEGRAM_CHAT_ID")

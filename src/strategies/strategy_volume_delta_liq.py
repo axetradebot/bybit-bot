@@ -29,8 +29,8 @@ class VolumeDeltaLiqStrategy(BaseStrategy):
     ]
 
     def __init__(self):
-        self._history: deque[dict] = deque(maxlen=12)
-        self._vol_history: deque[float] = deque(maxlen=288)
+        self._history: dict[str, deque[dict]] = {}
+        self._vol_history: dict[str, deque[float]] = {}
 
     def _snap(self, row: pd.Series) -> dict:
         return {
@@ -52,10 +52,13 @@ class VolumeDeltaLiqStrategy(BaseStrategy):
     ) -> SignalEvent | None:
         c = indicators_5m
         snap = self._snap(c)
-        self._history.append(snap)
-        self._vol_history.append(snap["volume"])
+        if symbol not in self._history:
+            self._history[symbol] = deque(maxlen=12)
+            self._vol_history[symbol] = deque(maxlen=288)
+        self._history[symbol].append(snap)
+        self._vol_history[symbol].append(snap["volume"])
 
-        if len(self._history) < 6:
+        if len(self._history[symbol]) < 6:
             return None
 
         atr = _sf(c.get("atr_14"))
@@ -71,7 +74,7 @@ class VolumeDeltaLiqStrategy(BaseStrategy):
         if atr_rank < 0.18:
             return None
 
-        h = list(self._history)
+        h = list(self._history[symbol])
         curr = h[-1]
         prev = h[-2]
 
@@ -86,8 +89,8 @@ class VolumeDeltaLiqStrategy(BaseStrategy):
 
         # Volume spike: 1.8x rolling mean
         vol_spike = False
-        if len(self._vol_history) >= 30:
-            arr = np.array(self._vol_history)
+        if len(self._vol_history[symbol]) >= 30:
+            arr = np.array(self._vol_history[symbol])
             avg_vol = float(arr.mean())
             vol_spike = curr["volume"] > 1.8 * avg_vol if avg_vol > 0 else False
 
@@ -139,7 +142,7 @@ class VolumeDeltaLiqStrategy(BaseStrategy):
             entry_price=close,
             stop_loss=sl,
             take_profit=tp,
-            leverage=10,
+            leverage=20,
             indicators_snapshot=build_indicator_snapshot(c),
             strategy_combo=["volume_delta", "liq_cluster",
                             "consolidation_break"],

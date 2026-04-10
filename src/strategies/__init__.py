@@ -21,6 +21,7 @@ from src.strategies.strategy_multitf_scalp import MultiTFScalpStrategy
 from src.strategies.strategy_volume_delta_liq import VolumeDeltaLiqStrategy
 from src.strategies.strategy_regime_adaptive import RegimeAdaptiveStrategy
 from src.strategies.strategy_high_winrate import HighWinRateStrategy
+from src.strategies.strategy_mean_reversion import MeanReversionStrategy
 from src.strategies.strategy_sniper import SniperStrategy
 
 if TYPE_CHECKING:
@@ -35,6 +36,7 @@ STRATEGY_REGISTRY: dict[str, type] = {
     "volume_delta_liq": VolumeDeltaLiqStrategy,
     "regime_adaptive": RegimeAdaptiveStrategy,
     "high_winrate": HighWinRateStrategy,
+    "mean_reversion": MeanReversionStrategy,
     "sniper": SniperStrategy,
 }
 

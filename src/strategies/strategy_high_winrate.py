@@ -39,9 +39,9 @@ class HighWinRateStrategy(BaseStrategy):
     blocked_regimes: list[tuple[str, str, str]] = []
 
     def __init__(self):
-        self._prev_close: float | None = None
-        self._prev_ema21: float | None = None
-        self._prev_macd: float | None = None
+        self._prev_close: dict[str, float] = {}
+        self._prev_ema21: dict[str, float] = {}
+        self._prev_macd: dict[str, float] = {}
 
     def generate_signal(
         self,
@@ -58,12 +58,12 @@ class HighWinRateStrategy(BaseStrategy):
         ema21 = _sf(c.get("ema_21"))
         macd_h = _sf(c.get("macd_hist"))
 
-        prev_close = self._prev_close
-        prev_ema21 = self._prev_ema21
-        prev_macd = self._prev_macd
-        self._prev_close = close
-        self._prev_ema21 = ema21
-        self._prev_macd = macd_h
+        prev_close = self._prev_close.get(symbol)
+        prev_ema21 = self._prev_ema21.get(symbol)
+        prev_macd = self._prev_macd.get(symbol)
+        self._prev_close[symbol] = close
+        self._prev_ema21[symbol] = ema21
+        self._prev_macd[symbol] = macd_h
 
         if prev_close is None or prev_ema21 is None or prev_macd is None:
             return None
@@ -187,7 +187,7 @@ class HighWinRateStrategy(BaseStrategy):
             entry_price=close,
             stop_loss=sl,
             take_profit=tp,
-            leverage=10,
+            leverage=20,
             indicators_snapshot=build_indicator_snapshot(c),
             strategy_combo=["high_winrate", "trend_follow",
                             "ema_pullback"],

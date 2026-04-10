@@ -75,6 +75,7 @@ _MIN_BUFFER = 20
 # ---------------------------------------------------------------------------
 _CHOP_FILTER_ADX_FLOOR = 25
 _CHOP_FILTER_VOL_FLOOR = 2.0
+_CHOP_FILTER_EXEMPT: frozenset[str] = frozenset({"mean_reversion"})
 
 
 def _passes_chop_filter(bar: pd.Series, direction: str) -> tuple[bool, str]:
@@ -182,7 +183,9 @@ class WebSocketListener:
         self._be_activate = settings.breakeven_activate_pct
         self._trail_activate = settings.trail_activate_pct
         self._trail_offset = settings.trail_offset_pct
+        self._max_hold_hours = settings.max_hold_hours
         self._trail_state: dict[str, dict] = {}
+        self._last_zombie_check: float = 0.0
 
         self.risk_manager = RiskManager(
             is_backtest=False, risk_pct=settings.live_risk_pct,
@@ -463,6 +466,10 @@ class WebSocketListener:
                 mark = float(mp)
                 self._latest_mark[symbol] = mark
                 self._check_trailing_stop(symbol, mark)
+            now = time.time()
+            if now - self._last_zombie_check > 300:
+                self._last_zombie_check = now
+                self._check_zombie_trades()
         except Exception as exc:
             log.error("ticker_handler_error", error=str(exc))
 
@@ -871,12 +878,14 @@ class WebSocketListener:
             "activated": False,
             "be_triggered": False,
             "current_sl": original_sl,
+            "opened_at": time.time(),
         }
         log.info("trail_registered",
                  symbol=symbol, direction=direction,
                  entry=entry_price,
                  be_at=f"{self._be_activate:.0%}",
-                 trail_at=f"{self._trail_activate:.0%}")
+                 trail_at=f"{self._trail_activate:.0%}",
+                 max_hold=f"{self._max_hold_hours}h")
 
     def _check_trailing_stop(self, symbol: str, mark_price: float) -> None:
         ts = self._trail_state.get(symbol)
@@ -949,6 +958,37 @@ class WebSocketListener:
         if symbol in self._trail_state:
             del self._trail_state[symbol]
 
+    def _check_zombie_trades(self) -> None:
+        """Close positions held longer than max_hold_hours with < 1% profit."""
+        if self._max_hold_hours <= 0:
+            return
+        now = time.time()
+        max_secs = self._max_hold_hours * 3600
+        for symbol, ts in list(self._trail_state.items()):
+            opened = ts.get("opened_at", 0)
+            if opened <= 0 or (now - opened) < max_secs:
+                continue
+            mark = self._latest_mark.get(symbol, 0)
+            if mark <= 0:
+                continue
+            entry = ts["entry"]
+            direction = ts["direction"]
+            if direction == "long":
+                gain_pct = (mark - entry) / entry
+            else:
+                gain_pct = (entry - mark) / entry
+            if gain_pct < 0.01:
+                hours_held = (now - opened) / 3600
+                log.info("zombie_trade_closing",
+                         symbol=symbol, direction=direction,
+                         hours_held=f"{hours_held:.1f}",
+                         gain=f"{gain_pct:.2%}", mark=mark)
+                result = self.order_manager.close_position(
+                    symbol, reason="zombie_timeout",
+                )
+                if result:
+                    self._unregister_trailing(symbol)
+
     # ----- strategy pipeline --------------------------------------------
 
     def _run_strategies(
@@ -977,7 +1017,7 @@ class WebSocketListener:
                     continue
 
                 passes, chop_reason = _passes_chop_filter(ind_5m, signal.direction)
-                if not passes:
+                if not passes and strategy.name not in _CHOP_FILTER_EXEMPT:
                     log.info("strategy_chop_filtered",
                              symbol=symbol, strategy=strategy.name,
                              direction=signal.direction, reason=chop_reason)

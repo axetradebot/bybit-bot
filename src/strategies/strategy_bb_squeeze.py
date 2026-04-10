@@ -25,7 +25,7 @@ class BBSqueezeStrategy(BaseStrategy):
     ]
 
     def __init__(self):
-        self._prev: dict | None = None
+        self._prev: dict[str, dict] = {}
 
     def generate_signal(
         self,
@@ -36,8 +36,8 @@ class BBSqueezeStrategy(BaseStrategy):
         liq_volume_1h: float,
     ) -> SignalEvent | None:
         curr = indicators_5m
-        prev = self._prev
-        self._prev = {
+        prev = self._prev.get(symbol)
+        self._prev[symbol] = {
             "bb_squeeze": curr.get("bb_squeeze"),
             "bb_upper": _sf(curr.get("bb_upper")),
             "bb_lower": _sf(curr.get("bb_lower")),
@@ -128,7 +128,7 @@ class BBSqueezeStrategy(BaseStrategy):
             entry_price=close,
             stop_loss=sl,
             take_profit=tp,
-            leverage=10,
+            leverage=20,
             indicators_snapshot=build_indicator_snapshot(curr),
             strategy_combo=["bb_squeeze", "ema_trend", "macd_momentum", "vwap_filter"],
             regime=regime,

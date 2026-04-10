@@ -26,8 +26,8 @@ class MultiTFScalpStrategy(BaseStrategy):
     ]
 
     def __init__(self):
-        self._prev_ofi: float | None = None
-        self._prev_macd: float | None = None
+        self._prev_ofi: dict[str, float] = {}
+        self._prev_macd: dict[str, float] = {}
 
     def generate_signal(
         self,
@@ -42,10 +42,10 @@ class MultiTFScalpStrategy(BaseStrategy):
 
         curr_ofi = _sf(c5.get("order_flow_imb"))
         curr_macd = _sf(c5.get("macd_fast_line"))
-        prev_ofi = self._prev_ofi
-        prev_macd = self._prev_macd
-        self._prev_ofi = curr_ofi
-        self._prev_macd = curr_macd
+        prev_ofi = self._prev_ofi.get(symbol)
+        prev_macd = self._prev_macd.get(symbol)
+        self._prev_ofi[symbol] = curr_ofi
+        self._prev_macd[symbol] = curr_macd
 
         if prev_ofi is None or prev_macd is None:
             return None
@@ -129,7 +129,7 @@ class MultiTFScalpStrategy(BaseStrategy):
             entry_price=close,
             stop_loss=sl,
             take_profit=tp,
-            leverage=10,
+            leverage=20,
             indicators_snapshot=build_indicator_snapshot(c5),
             strategy_combo=["multitf_trend", "ema_pullback",
                             "flow_confirmation"],
