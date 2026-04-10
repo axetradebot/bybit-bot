@@ -2,11 +2,13 @@
 Mean-Reversion strategy for choppy/range-bound markets.
 
 Activates when ADX < 20 (opposite of the trend filter) and fades
-Bollinger Band extremes with RSI confirmation.
+Bollinger Band extremes with RSI confirmation. Exempt from the chop
+filter since it deliberately trades range-bound conditions.
 
 Entry:
   - Long: close below BB lower band, RSI < 30 (oversold), ADX < 20
   - Short: close above BB upper band, RSI > 70 (overbought), ADX < 20
+  - BB width must be >= 1.2x ATR (ensures meaningful range)
 
 SL:  Beyond the BB band + 0.3 ATR buffer
 TP:  BB mid (VWAP used as secondary target if available)
@@ -29,12 +31,12 @@ class MeanReversionStrategy(BaseStrategy):
         ("high", "*", "*"),
     ]
 
-    ADX_CEILING = 15
+    ADX_CEILING = 20
     RSI_OVERSOLD = 30
     RSI_OVERBOUGHT = 70
-    MIN_BB_WIDTH_ATR = 1.5
+    MIN_BB_WIDTH_ATR = 1.2
     SL_BUFFER_ATR = 0.3
-    MIN_RR = 1.2
+    MIN_RR = 1.0
 
     def generate_signal(
         self,
