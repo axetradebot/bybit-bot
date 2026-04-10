@@ -179,6 +179,7 @@ class WebSocketListener:
         self._sniper_tfs: list[str] = ["15m", "4h"]
         self._last_signals: dict[str, dict] = {}
 
+        self._be_activate = settings.breakeven_activate_pct
         self._trail_activate = settings.trail_activate_pct
         self._trail_offset = settings.trail_offset_pct
         self._trail_state: dict[str, dict] = {}
@@ -868,11 +869,14 @@ class WebSocketListener:
             "original_sl": original_sl,
             "hwm": entry_price,
             "activated": False,
+            "be_triggered": False,
             "current_sl": original_sl,
         }
         log.info("trail_registered",
                  symbol=symbol, direction=direction,
-                 entry=entry_price, activate_at=f"{self._trail_activate:.0%}")
+                 entry=entry_price,
+                 be_at=f"{self._be_activate:.0%}",
+                 trail_at=f"{self._trail_activate:.0%}")
 
     def _check_trailing_stop(self, symbol: str, mark_price: float) -> None:
         ts = self._trail_state.get(symbol)
@@ -889,6 +893,24 @@ class WebSocketListener:
 
         if gain_pct < 0:
             return
+
+        if not ts["be_triggered"] and gain_pct >= self._be_activate:
+            ts["be_triggered"] = True
+            be_sl = entry
+            if direction == "long" and be_sl > ts["current_sl"]:
+                ok = self.order_manager.update_stop_loss(symbol, be_sl)
+                if ok:
+                    ts["current_sl"] = be_sl
+                    log.info("breakeven_sl_set",
+                             symbol=symbol, sl=be_sl,
+                             gain=f"{gain_pct:.2%}", mark=mark_price)
+            elif direction == "short" and be_sl < ts["current_sl"]:
+                ok = self.order_manager.update_stop_loss(symbol, be_sl)
+                if ok:
+                    ts["current_sl"] = be_sl
+                    log.info("breakeven_sl_set",
+                             symbol=symbol, sl=be_sl,
+                             gain=f"{gain_pct:.2%}", mark=mark_price)
 
         if not ts["activated"] and gain_pct >= self._trail_activate:
             ts["activated"] = True
