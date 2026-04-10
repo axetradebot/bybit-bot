@@ -161,10 +161,14 @@ class WebSocketListener:
         self._latest_15m: dict[str, pd.Series] = {}
 
         wanted = settings.live_strategy.lower()
+        wanted_set = (
+            None if wanted == "all"
+            else set(w.strip() for w in wanted.split(","))
+        )
 
         self._strategies: list[BaseStrategy] = []
         for name, cls in STRATEGY_REGISTRY.items():
-            if wanted != "all" and name != wanted:
+            if wanted_set is not None and name not in wanted_set:
                 continue
             try:
                 if name == "regime_adaptive":
