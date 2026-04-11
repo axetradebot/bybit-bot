@@ -10,7 +10,7 @@ Entry:
   - Short: close above BB upper band, RSI > 70 (overbought), ADX < 20
   - BB width must be >= 1.2x ATR (ensures meaningful range)
 
-SL:  Beyond the BB band + 0.3 ATR buffer
+SL:  max(1.0x ATR, 1.5% of price) below/above entry
 TP:  BB mid (VWAP used as secondary target if available)
 
 Position sizing uses 1% risk (smaller than Sniper's 2.5%) since
@@ -35,7 +35,8 @@ class MeanReversionStrategy(BaseStrategy):
     RSI_OVERSOLD = 30
     RSI_OVERBOUGHT = 70
     MIN_BB_WIDTH_ATR = 1.2
-    SL_BUFFER_ATR = 0.3
+    SL_BUFFER_ATR = 1.0
+    MIN_SL_PCT = 0.015
     MIN_RR = 1.0
 
     def generate_signal(
@@ -74,13 +75,15 @@ class MeanReversionStrategy(BaseStrategy):
         direction = None
         sl = tp = 0.0
 
+        sl_buffer = max(self.SL_BUFFER_ATR * atr, close * self.MIN_SL_PCT)
+
         if close < bb_lower and rsi < self.RSI_OVERSOLD:
             direction = "long"
-            sl = bb_lower - self.SL_BUFFER_ATR * atr
+            sl = close - sl_buffer
             tp = bb_mid
         elif close > bb_upper and rsi > self.RSI_OVERBOUGHT:
             direction = "short"
-            sl = bb_upper + self.SL_BUFFER_ATR * atr
+            sl = close + sl_buffer
             tp = bb_mid
 
         if direction is None:
