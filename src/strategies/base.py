@@ -63,6 +63,7 @@ class SignalEvent(BaseModel):
     timeframe: str = "5m"
     # Backtest / execution hint: limit+maker for mean-reversion, market+taker for momentum
     fill_mode: Literal["limit", "market"] | None = None
+    risk_pct: float | None = None
 
     model_config = {"arbitrary_types_allowed": True}
 

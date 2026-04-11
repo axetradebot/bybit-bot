@@ -243,7 +243,10 @@ class RiskManager:
         SLIPPAGE_BPS = 0.0003
         round_trip_cost_rate = MAKER_FEE + TAKER_FEE + SLIPPAGE_BPS
 
-        effective_risk = self._ema_trend_risk(signal)
+        if signal.risk_pct is not None:
+            effective_risk = signal.risk_pct
+        else:
+            effective_risk = self._ema_trend_risk(signal)
         risk_amount = account_equity * effective_risk
         size_base = risk_amount / (risk_dist + entry * round_trip_cost_rate)
         position_size_usd = size_base * entry

@@ -38,6 +38,7 @@ class MeanReversionStrategy(BaseStrategy):
     SL_BUFFER_ATR = 1.0
     MIN_SL_PCT = 0.015
     MIN_RR = 1.0
+    RISK_PCT = 0.01
 
     def generate_signal(
         self,
@@ -151,4 +152,5 @@ class MeanReversionStrategy(BaseStrategy):
             regime=regime,
             timestamp=ts,
             fill_mode="limit",
+            risk_pct=self.RISK_PCT,
         )
