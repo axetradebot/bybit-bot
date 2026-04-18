@@ -134,12 +134,27 @@ class StrategyAdapter:
         if signal is None or signal.direction == "flat":
             return None
 
-        fill_mode = signal.fill_mode
+        fill_mode = signal.effective_fill_mode()
         if fill_mode is None:
             head = signal.strategy_combo[0] if signal.strategy_combo else ""
             fill_mode = (
-                "limit" if head in LIMIT_FILL_HEADS else "market"
+                "post_only" if head in LIMIT_FILL_HEADS else "market"
             )
+
+        # Pull strategy-level overrides via the signal first, then fall
+        # back to the BaseStrategy class defaults.  This keeps the
+        # simulator decoupled from individual strategy classes while
+        # still respecting per-strategy cooldowns / TP ladders / BE
+        # behaviour.
+        cooldown_bars = signal.cooldown_bars
+        if cooldown_bars is None:
+            cooldown_bars = getattr(self.base, "cooldown_bars", None)
+
+        tp_ladder = signal.tp_ladder
+        if tp_ladder is None:
+            tp_ladder = getattr(self.base, "default_tp_ladder", None)
+
+        move_be_on_tp1 = getattr(self.base, "move_be_on_tp1", True)
 
         return EntryOrder(
             direction=signal.direction,
@@ -149,4 +164,7 @@ class StrategyAdapter:
             indicators_snapshot=signal.indicators_snapshot,
             limit_price=float(signal.entry_price),
             fill_mode=fill_mode,
+            cooldown_bars=cooldown_bars,
+            tp_ladder=tp_ladder,
+            move_be_on_tp1=move_be_on_tp1,
         )

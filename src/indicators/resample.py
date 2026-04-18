@@ -81,21 +81,31 @@ def build_bars_for_tf(df_5m: pd.DataFrame, target_tf: str) -> pd.DataFrame:
         TA_COL_MAP,
         compute_derived,
         compute_ta_indicators,
+        pack_indicator_extras,
+    )
+    from src.indicators.custom_indicators import (
+        detect_momentum_divergence,
+        detect_rsi_divergence,
     )
 
     resampled = resample_candles(df_5m, target_tf)
     with_ta = compute_ta_indicators(resampled)
     with_derived = compute_derived(with_ta)
+    with_div = detect_rsi_divergence(with_derived)
+    with_div = detect_momentum_divergence(with_div)
 
     rename_map = {
-        ta: db for ta, db in TA_COL_MAP.items() if ta in with_derived.columns
+        ta: db for ta, db in TA_COL_MAP.items() if ta in with_div.columns
     }
-    result = with_derived.rename(columns=rename_map)
+    result = with_div.rename(columns=rename_map)
 
     for col in ("funding_8h", "funding_24h_cum", "liq_volume_1h"):
         if col not in result.columns:
             result[col] = 0.0
-    if "extras" not in result.columns:
-        result["extras"] = [{} for _ in range(len(result))]
+
+    # Pack divergence + (when present) coinglass flags into extras so
+    # strategies that read `bar["extras"]` (rsi_divergence, sniper)
+    # behave the same as live.
+    result["extras"] = result.apply(pack_indicator_extras, axis=1)
 
     return result

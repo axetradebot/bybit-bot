@@ -65,7 +65,15 @@ class EntryOrder:
     strategy_combo: list[str]
     indicators_snapshot: dict
     limit_price: float = 0.0
-    fill_mode: str = "limit"  # "limit" | "market"
+    fill_mode: str = "limit"  # "limit" | "post_only" | "market"
+    # Per-strategy minimum bars between consecutive trades (None ->
+    # simulator default COOLDOWN_BARS).
+    cooldown_bars: int | None = None
+    # Partial-TP ladder.  Each entry is (R-multiple, fraction-of-position).
+    # Fractions must sum to <= 1.0; whatever isn't closed by the ladder
+    # rides to the absolute take_profit (= sl_distance × tp_distance/sl_distance).
+    tp_ladder: list[tuple[float, float]] | None = None
+    move_be_on_tp1: bool = True
 
 
 @dataclass
@@ -120,6 +128,17 @@ class _OpenPosition:
     high_watermark: float = 0.0
     mfe_pct: float = 0.0
     mae_pct: float = 0.0
+    # Partial-TP state
+    remaining_fraction: float = 1.0
+    realized_pnl_usd: float = 0.0          # PnL booked from partial closes
+    tp_ladder_remaining: list[tuple[float, float, float]] | None = None
+    # Each entry: (price_level, fraction_of_original, realized_amount).
+    # Sorted by price for longs (asc), descending for shorts.
+    move_be_on_tp1: bool = True
+    # Per-strategy cooldown applied after exit.
+    cooldown_bars: int | None = None
+    # Cursor into the sorted funding history (advanced on each bar).
+    funding_cursor: int = 0
 
 
 @dataclass
@@ -247,7 +266,7 @@ class Simulator:
             log.info("bars_loaded", rows=len(bar_data), source="prebuilt")
         else:
             bar_data = self._load_bars(engine, from_date, to_date)
-        funding_map = self._load_funding(engine)
+        self._funding_history = self._load_funding(engine)
 
         log.info(
             "simulation_start",
@@ -261,6 +280,7 @@ class Simulator:
         pending: _PendingOrder | None = None
         closed: list[ClosedTrade] = []
         last_exit_bar: int = -COOLDOWN_BARS
+        last_exit_cooldown: int = COOLDOWN_BARS
         unfilled_count: int = 0
 
         for i in range(len(bar_data)):
@@ -301,7 +321,7 @@ class Simulator:
                         pending = None
 
                 if filled and pending is not None:
-                    fee = TAKER_FEE if is_market else MAKER_FEE
+                    fee = TAKER_FEE if odr.fill_mode == "market" else MAKER_FEE
                     position = self._fill_entry(
                         odr, fill_price, bar, i, fee,
                     )
@@ -309,6 +329,7 @@ class Simulator:
                         position, bar_high, bar_low,
                     )
                     if same_bar_exit is not None:
+                        cd = position.cooldown_bars or COOLDOWN_BARS
                         trade = self._close_position(
                             position, same_bar_exit,
                             bar_ts.to_pydatetime(), "sl",
@@ -316,6 +337,7 @@ class Simulator:
                         closed.append(trade)
                         position = None
                         last_exit_bar = i
+                        last_exit_cooldown = cd
                     pending = None
 
             # 2. Check breakeven/trailing activation + exit for existing position
@@ -328,17 +350,19 @@ class Simulator:
                     self._check_trailing(position, bar_high, bar_low)
                 trade = self._check_exit(position, bar)
                 if trade is not None:
+                    cd = position.cooldown_bars or COOLDOWN_BARS
                     closed.append(trade)
                     position = None
                     last_exit_bar = i
+                    last_exit_cooldown = cd
 
-            # 3. Apply funding
+            # 3. Apply funding (interval-overlap, not exact-ts match)
             if position is not None:
-                self._apply_funding(position, bar_ts, funding_map)
+                self._apply_funding(position, bar_ts)
 
-            # 4. Generate new signal (with cooldown)
+            # 4. Generate new signal (with per-strategy cooldown)
             if (position is None and pending is None
-                    and (i - last_exit_bar) >= COOLDOWN_BARS):
+                    and (i - last_exit_bar) >= last_exit_cooldown):
                 order = self.strategy.on_bar(bar, prev_bar)
                 if order is not None:
                     limit_px = (
@@ -403,7 +427,14 @@ class Simulator:
         log.info("bars_loaded", rows=len(merged))
         return merged
 
-    def _load_funding(self, engine) -> dict[pd.Timestamp, float]:
+    def _load_funding(self, engine) -> list[tuple[pd.Timestamp, float]]:
+        """
+        Load funding history as a chronologically-sorted list of
+        ``(timestamp, rate)`` tuples.  We accrue funding via interval
+        overlap (any fix between the previous bar and the current bar)
+        rather than exact 5m-bar timestamp matching, which previously
+        silently dropped most funding events.
+        """
         df = pd.read_sql(
             "SELECT timestamp, funding_rate FROM funding_history "
             "WHERE symbol = %(symbol)s ORDER BY timestamp",
@@ -411,8 +442,18 @@ class Simulator:
             params={"symbol": self.symbol},
             parse_dates=["timestamp"],
         )
-        return {pd.Timestamp(row["timestamp"]): float(row["funding_rate"])
-                for _, row in df.iterrows()}
+        return [
+            (pd.Timestamp(row["timestamp"]), float(row["funding_rate"]))
+            for _, row in df.iterrows()
+        ]
+
+    def _initial_funding_cursor(self, entry_ts: pd.Timestamp) -> int:
+        """First funding-history index whose timestamp > entry_ts."""
+        history = getattr(self, "_funding_history", None) or []
+        for idx, (ts, _rate) in enumerate(history):
+            if ts > entry_ts:
+                return idx
+        return len(history)
 
     # ----- fill logic -------------------------------------------------------
 
@@ -440,6 +481,21 @@ class Simulator:
         entry_fee = position_size_usd * fee_rate
         bar_ts = pd.Timestamp(bar["timestamp"])
 
+        # Build the partial-TP ladder in absolute price space.
+        ladder_remaining: list[tuple[float, float, float]] | None = None
+        if order.tp_ladder:
+            risk_dist = order.sl_distance
+            ladder_remaining = []
+            sign = 1 if order.direction == "long" else -1
+            for r_mult, frac in order.tp_ladder:
+                level = fill_price + sign * r_mult * risk_dist
+                ladder_remaining.append((level, frac, 0.0))
+            # Sort so we hit them in price-distance order.
+            ladder_remaining.sort(
+                key=lambda t: t[0],
+                reverse=(order.direction == "short"),
+            )
+
         return _OpenPosition(
             direction=order.direction,
             entry_time=bar_ts.to_pydatetime(),
@@ -458,6 +514,10 @@ class Simulator:
             entry_bar_idx=bar_idx,
             fees_paid_usd=entry_fee,
             fee_rate_per_side=fee_rate,
+            tp_ladder_remaining=ladder_remaining,
+            move_be_on_tp1=order.move_be_on_tp1,
+            cooldown_bars=order.cooldown_bars,
+            funding_cursor=self._initial_funding_cursor(bar_ts),
         )
 
     def _update_mfe_mae(
@@ -537,12 +597,62 @@ class Simulator:
             return pos.stop_loss
         return None
 
+    def _process_partial_tps(
+        self, pos: _OpenPosition, bar_high: float, bar_low: float,
+    ) -> None:
+        """
+        Consume any partial-TP rungs touched by this bar.  Each rung
+        closes ``frac`` of the original notional at the rung's price,
+        accruing realised PnL net of taker fees on the partial close.
+        Triggers BE on the SL after the first rung fills (when
+        ``move_be_on_tp1`` is True).
+        """
+        ladder = pos.tp_ladder_remaining
+        if not ladder:
+            return
+        idx = 0
+        while idx < len(ladder):
+            level, frac, realized = ladder[idx]
+            hit = (
+                bar_high >= level if pos.direction == "long"
+                else bar_low <= level
+            )
+            if not hit:
+                break
+            partial_notional = pos.position_size_usd * frac
+            if pos.direction == "long":
+                raw = (level - pos.entry_price) / pos.entry_price
+            else:
+                raw = (pos.entry_price - level) / pos.entry_price
+            partial_pnl = partial_notional * raw
+            partial_fee = partial_notional * pos.fee_rate_per_side
+            pos.realized_pnl_usd += partial_pnl - partial_fee
+            pos.fees_paid_usd += partial_fee
+            pos.remaining_fraction = max(0.0, pos.remaining_fraction - frac)
+            ladder[idx] = (level, frac, partial_notional)
+            # First rung fills: snap SL to entry (BE).
+            if (idx == 0 and pos.move_be_on_tp1
+                    and not pos.be_activated):
+                pos.stop_loss = pos.entry_price
+                pos.be_activated = True
+            idx += 1
+        # Drop processed rungs.
+        if idx > 0:
+            pos.tp_ladder_remaining = ladder[idx:]
+
     def _check_exit(
         self, pos: _OpenPosition, bar: pd.Series,
     ) -> ClosedTrade | None:
         low = float(bar["low"])
         high = float(bar["high"])
         bar_ts = pd.Timestamp(bar["timestamp"]).to_pydatetime()
+
+        # 1. Process partial TPs first — moves BE etc.
+        self._process_partial_tps(pos, high, low)
+        if pos.remaining_fraction <= 1e-6:
+            return self._close_position(
+                pos, pos.entry_price, bar_ts, "tp", from_ladder_only=True,
+            )
 
         if pos.direction == "long":
             sl_hit = low <= pos.stop_loss
@@ -581,18 +691,43 @@ class Simulator:
         exit_price: float,
         exit_time: datetime,
         exit_reason: str,
+        from_ladder_only: bool = False,
     ) -> ClosedTrade:
-        if pos.direction == "long":
-            raw_pct = (exit_price - pos.entry_price) / pos.entry_price
+        # Remaining fraction of the position closed at exit_price.
+        remaining = pos.remaining_fraction
+        remaining_notional = pos.position_size_usd * remaining
+
+        if remaining_notional > 0 and not from_ladder_only:
+            if pos.direction == "long":
+                raw_pct_remaining = (exit_price - pos.entry_price) / pos.entry_price
+            else:
+                raw_pct_remaining = (pos.entry_price - exit_price) / pos.entry_price
+            exit_pnl_remaining = remaining_notional * raw_pct_remaining
+            exit_fee = remaining_notional * pos.fee_rate_per_side
         else:
-            raw_pct = (pos.entry_price - exit_price) / pos.entry_price
+            exit_pnl_remaining = 0.0
+            exit_fee = 0.0
 
-        exit_fee = pos.position_size_usd * pos.fee_rate_per_side
         total_fees = pos.fees_paid_usd + exit_fee
-
-        pnl_usd = (pos.position_size_usd * raw_pct
-                    - pos.funding_paid_usd - total_fees)
-        pnl_pct = pnl_usd / pos.position_size_usd if pos.position_size_usd > 0 else 0.0
+        pnl_usd = (
+            pos.realized_pnl_usd
+            + exit_pnl_remaining
+            - pos.funding_paid_usd
+            - exit_fee
+        )
+        # Aggregate PnL pct relative to original notional.
+        pnl_pct = (
+            pnl_usd / pos.position_size_usd
+            if pos.position_size_usd > 0 else 0.0
+        )
+        # Effective exit price for reporting: blend of partial TPs + final exit.
+        if from_ladder_only:
+            # Reconstruct an "average exit price" from realized PnL.
+            avg_pct = pos.realized_pnl_usd / pos.position_size_usd
+            if pos.direction == "long":
+                exit_price = pos.entry_price * (1 + avg_pct)
+            else:
+                exit_price = pos.entry_price * (1 - avg_pct)
 
         self.equity += pnl_usd
 
@@ -626,12 +761,24 @@ class Simulator:
         self,
         pos: _OpenPosition,
         bar_ts: pd.Timestamp,
-        funding_map: dict[pd.Timestamp, float],
     ) -> None:
-        rate = funding_map.get(bar_ts)
-        if rate is None:
+        """
+        Accrue funding for any 8h fix whose timestamp falls in
+        ``(prev_bar_ts, bar_ts]``.  Only the *remaining* (un-laddered)
+        notional pays funding, since partial-TP closes leave the rest
+        of the book exposed.
+        """
+        history = getattr(self, "_funding_history", None) or []
+        n = len(history)
+        notional = pos.position_size_usd * pos.remaining_fraction
+        if notional <= 0:
             return
-        if pos.direction == "long":
-            pos.funding_paid_usd += pos.position_size_usd * rate
-        else:
-            pos.funding_paid_usd -= pos.position_size_usd * rate
+        while pos.funding_cursor < n:
+            ts, rate = history[pos.funding_cursor]
+            if ts > bar_ts:
+                break
+            if pos.direction == "long":
+                pos.funding_paid_usd += notional * rate
+            else:
+                pos.funding_paid_usd -= notional * rate
+            pos.funding_cursor += 1

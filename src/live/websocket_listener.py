@@ -60,7 +60,7 @@ from src.live.order_manager import OrderManager  # noqa: E402
 from src.live.telegram_notifier import TelegramNotifier  # noqa: E402
 from src.risk.risk_manager import RiskManager  # noqa: E402
 from src.strategies import STRATEGY_REGISTRY  # noqa: E402
-from src.strategies.base import BaseStrategy, _sf  # noqa: E402
+from src.strategies.base import BaseStrategy, SignalEvent, _sf  # noqa: E402
 from src.strategies.strategy_sniper import SniperStrategy  # noqa: E402
 
 log = structlog.get_logger()
@@ -183,6 +183,12 @@ class WebSocketListener:
         self._sniper_4h: dict[str, SniperStrategy] = {}
         self._sniper_tfs: list[str] = ["15m", "4h"]
         self._last_signals: dict[str, dict] = {}
+        # Per-symbol cache of the SignalEvent that just triggered an
+        # open-position call.  The execution-stream handler uses this to
+        # rebase SL/TP/ladder onto the actual fill price exactly once,
+        # then drops the entry to avoid double-rebasing on subsequent
+        # partial-fill events.
+        self._pending_entry_signals: dict[str, SignalEvent] = {}
 
         self._be_activate = settings.breakeven_activate_pct
         self._trail_activate = settings.trail_activate_pct
@@ -483,6 +489,8 @@ class WebSocketListener:
                 symbol = fill.get("symbol", "")
                 side = fill.get("side", "")
                 order_id = fill.get("orderId", "")
+                exec_price = float(fill.get("execPrice", 0) or 0)
+                exec_qty = float(fill.get("execQty", 0) or 0)
 
                 tracked = self.order_manager._open_orders.get(symbol, {})
                 direction = tracked.get("direction", "")
@@ -492,19 +500,56 @@ class WebSocketListener:
                     (direction == "long" and side.lower() == "sell")
                     or (direction == "short" and side.lower() == "buy")
                 )
+                is_open_entry = bool(tracked) and not is_close
 
                 signal_info = self._last_signals.get(symbol, {})
                 sl = signal_info.get("sl", 0)
                 tp = signal_info.get("tp", 0)
 
                 self.order_manager.handle_fill(fill)
+
+                # Rebase SL/TP/ladder onto actual fill price for an
+                # entry execution.  Done at most once per entry.
+                if (is_open_entry and exec_price > 0 and exec_qty > 0
+                        and symbol in self._pending_entry_signals):
+                    pending_sig = self._pending_entry_signals.pop(symbol)
+                    try:
+                        self.order_manager.rebase_protective_orders_from_fill(
+                            pending_sig, exec_price, exec_qty,
+                        )
+                        # Refresh trailing-stop bookkeeping with the
+                        # actual fill price so trailing maths use the
+                        # real entry, not the original limit estimate.
+                        ts = self._trail_state.get(symbol)
+                        if ts is not None:
+                            ts["entry"] = exec_price
+                            ts["original_sl"] = (
+                                exec_price - abs(
+                                    pending_sig.entry_price
+                                    - pending_sig.stop_loss
+                                )
+                                if pending_sig.direction == "long"
+                                else exec_price + abs(
+                                    pending_sig.entry_price
+                                    - pending_sig.stop_loss
+                                )
+                            )
+                            ts["current_sl"] = ts["original_sl"]
+                            ts["hwm"] = exec_price
+                        log.info("entry_fill_rebase_done",
+                                 symbol=symbol, fill_price=exec_price,
+                                 fill_qty=exec_qty)
+                    except Exception as exc:
+                        log.error("entry_fill_rebase_failed",
+                                  symbol=symbol, error=str(exc))
+
                 if is_close:
                     self._unregister_trailing(symbol)
                 self.telegram.notify_fill(
                     symbol=symbol,
                     side=side,
-                    price=float(fill.get("execPrice", 0) or 0),
-                    qty=float(fill.get("execQty", 0) or 0),
+                    price=exec_price,
+                    qty=exec_qty,
                     order_id=order_id,
                     sl=sl, tp=tp,
                     is_close=is_close,
@@ -850,6 +895,7 @@ class WebSocketListener:
             "direction": approved.direction,
             "entry": approved.entry_price,
         }
+        self._pending_entry_signals[symbol] = approved
 
         order = self.order_manager.open_position(approved)
         log.info("sniper_executed",
@@ -1070,6 +1116,7 @@ class WebSocketListener:
                     "direction": approved.direction,
                     "entry": approved.entry_price,
                 }
+                self._pending_entry_signals[symbol] = approved
 
                 order = self.order_manager.open_position(approved)
 
@@ -1119,6 +1166,7 @@ class WebSocketListener:
         if approved is None:
             return {"status": "blocked", "reason": "risk_manager"}
 
+        self._pending_entry_signals[approved.symbol] = approved
         order = self.order_manager.open_position(approved)
         if order:
             self._register_trailing(
