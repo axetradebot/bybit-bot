@@ -28,9 +28,42 @@ from src.backtest.live_aligned_portfolio import (
     LivePortfolioTrade,
     collect_trades_live_aligned,
     run_portfolio_live_aligned,
+    synthesize_volume_delta,
 )
+from src.strategies.base import _sf
 
 PrecomputedTrade = LivePortfolioTrade
+
+
+# Live-bot anti-chop filter — historical "best of 19" from the
+# best_filters_sim grid search (NEW-6: DI + BB mid + vol>=1.2 + no squeeze).
+# That config produced +2,445% PnL over 3 years at 3% risk while the
+# tighter "ADX>=25 + vol>=2.0" baseline went -97%.  We keep the looser
+# floor and gate on BB squeeze instead.
+_CHOP_VOL_FLOOR = 1.2
+
+
+def _chop_filter(bar, direction: str) -> bool:
+    p, m = _sf(bar.get("plus_di")), _sf(bar.get("minus_di"))
+    if p > 0 or m > 0:
+        if direction == "long" and p <= m:
+            return False
+        if direction == "short" and m <= p:
+            return False
+    bb_mid = _sf(bar.get("bb_mid"))
+    close = _sf(bar.get("close"))
+    if bb_mid > 0 and close > 0:
+        if direction == "long" and close <= bb_mid:
+            return False
+        if direction == "short" and close >= bb_mid:
+            return False
+    vr = _sf(bar.get("volume_ratio"))
+    if vr > 0 and vr < _CHOP_VOL_FLOOR:
+        return False
+    sq = bar.get("bb_squeeze")
+    if sq is True:
+        return False
+    return True
 
 LEVERAGE = 20
 START_EQUITY = 3000.0
@@ -46,10 +79,26 @@ FROM = "2023-01-01"
 TO = "2026-04-03"
 
 
+def _make_sniper():
+    """Fresh Sniper per (sym, tf) WITHOUT the partial-TP ladder.
+    Ablation v3 proved the ladder cuts winners short and inverts PnL
+    (90%+ losses with ladder vs single-TP+trail in live-aligned sims)."""
+    from src.strategies.strategy_sniper import SniperStrategy
+    s = SniperStrategy()
+    s.default_tp_ladder = ()
+    s.move_be_on_tp1 = False
+    s.cooldown_bars = 6  # historical optimum
+    return s
+
+
 def collect_and_resolve_trades(trading_bars, context_df, symbol, tf):
-    """Live-aligned collect (limit entry + TTL, absolute SL/TP from signal)."""
+    """Live-aligned collect with NEW-6 inline anti-chop filter
+    (DI + BB mid + vol>=1.2 + no squeeze) AND ladder disabled."""
     rows = collect_trades_live_aligned(
-        trading_bars, context_df, symbol, tf, snap_fn=lambda _b, _c: {},
+        trading_bars, context_df, symbol, tf,
+        snap_fn=lambda _b, _c: {},
+        strategy=_make_sniper(),
+        chop_filter=_chop_filter,
     )
     return [t for t, _ in rows]
 
@@ -89,9 +138,10 @@ def run_portfolio(all_trades: list[PrecomputedTrade]) -> dict:
 
 def load_candles(symbol, cache_dir):
     cache_path = cache_dir / f"{symbol}_{FROM}_{TO}_5m.parquet"
-    if cache_path.exists():
-        return pd.read_parquet(cache_path)
-    return pd.DataFrame()
+    if not cache_path.exists():
+        return pd.DataFrame()
+    df = pd.read_parquet(cache_path)
+    return synthesize_volume_delta(df)
 
 
 def main():
@@ -101,7 +151,7 @@ def main():
     print("PORTFOLIO SIMULATION: Shared equity, concurrent positions", flush=True)
     print(f"Equity: ${START_EQUITY:,.0f}  |  Leverage: {LEVERAGE}x  |  "
           f"Max concurrent: {MAX_CONCURRENT}", flush=True)
-    print(f"Risk levels to compare: {', '.join(f'{r:.1%}' for r in [0.01, 0.015, 0.02])}",
+    print(f"Risk levels to compare: {', '.join(f'{r:.2%}' for r in [0.005, 0.0075, 0.01, 0.0125, 0.015, 0.02, 0.025, 0.03])}",
           flush=True)
     print("=" * 75, flush=True)
 
@@ -131,7 +181,7 @@ def main():
     print(f"\n  Total resolved trades: {len(all_trades)}", flush=True)
 
     # Run portfolio simulation at multiple risk levels
-    risk_levels = [0.01, 0.015, 0.02]
+    risk_levels = [0.005, 0.0075, 0.01, 0.0125, 0.015, 0.02, 0.025, 0.03]
     results_by_risk: dict[float, dict] = {}
 
     for rp in risk_levels:

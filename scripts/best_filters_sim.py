@@ -11,10 +11,12 @@ Runs the TOP recommended filter setups through the live-aligned engine
 
 Run:
     python scripts/best_filters_sim.py
+    python scripts/best_filters_sim.py --start-equity 6000
 """
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import os
 import sys
@@ -48,7 +50,7 @@ from src.backtest.live_aligned_portfolio import (
 from src.indicators.resample import CONTEXT_TF, build_bars_for_tf
 from src.strategies.base import _sf
 
-START_EQUITY = 3_000.0
+DEFAULT_START_EQUITY = 3_000.0
 RISK_GRID = (0.005, 0.0075, 0.01, 0.0125, 0.015, 0.02, 0.025, 0.03)
 MAX_CONCURRENT = 4
 
@@ -227,10 +229,11 @@ SCENARIOS = [
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _monthly_pnl(trades: list[LivePortfolioTrade], risk_pct: float) -> list[dict]:
+def _monthly_pnl(trades: list[LivePortfolioTrade], risk_pct: float,
+                 start_equity: float = DEFAULT_START_EQUITY) -> list[dict]:
     """Run the portfolio and bucket PnL by calendar month."""
     r = run_portfolio_live_aligned(
-        trades, start_equity=START_EQUITY, risk_pct=risk_pct,
+        trades, start_equity=start_equity, risk_pct=risk_pct,
         max_concurrent=MAX_CONCURRENT, track_equity_curve=True,
         curve_from=FROM,
     )
@@ -238,7 +241,7 @@ def _monthly_pnl(trades: list[LivePortfolioTrade], risk_pct: float) -> list[dict
     if len(curve) < 2:
         return []
     months: dict[str, dict] = {}
-    prev_eq = START_EQUITY
+    prev_eq = start_equity
     for ts, eq in curve:
         key = pd.Timestamp(ts).strftime("%Y-%m")
         if key not in months:
@@ -280,6 +283,12 @@ def _per_symbol_stats(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start-equity", type=float, default=DEFAULT_START_EQUITY,
+                        help="Starting equity in USD (default %(default)s)")
+    args = parser.parse_args()
+    START_EQUITY = args.start_equity
+
     cache_dir = project_root / "data_cache"
     w = 120
 
@@ -450,7 +459,7 @@ def main() -> None:
     if best_pred:
         best_risk = best["risk_pct"]
         filt_trades = [t for t, snap in rows if best_pred(snap, t.direction)]
-        monthly = _monthly_pnl(filt_trades, best_risk)
+        monthly = _monthly_pnl(filt_trades, best_risk, START_EQUITY)
         if monthly:
             print(f"\n{'='*w}", flush=True)
             print(f"MONTHLY PnL for: {best_label}  @ risk {best_risk:.2%}", flush=True)
