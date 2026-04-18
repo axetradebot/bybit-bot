@@ -26,7 +26,11 @@ class Settings(BaseSettings):
 
     live_strategy: str = Field("all", env="LIVE_STRATEGY")
     live_equity: float = Field(1_000.0, env="LIVE_EQUITY")
-    live_risk_pct: float = Field(0.025, env="LIVE_RISK_PCT")
+    # 0.5% per trade — validated by 3yr live-aligned portfolio replay
+    # (reports/portfolio_sim_v4_maker_fees.txt: +158% PnL / +37% CAGR /
+    # 36% MaxDD).  At 2.5% the same simulation showed -83% PnL / 97%
+    # MaxDD, so this default change is a safety-critical fix.
+    live_risk_pct: float = Field(0.005, env="LIVE_RISK_PCT")
 
     breakeven_activate_pct: float = Field(0.20, env="BREAKEVEN_ACTIVATE_PCT")
     trail_activate_pct: float = Field(0.20, env="TRAIL_ACTIVATE_PCT")
