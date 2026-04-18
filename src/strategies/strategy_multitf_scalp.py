@@ -24,6 +24,9 @@ class MultiTFScalpStrategy(BaseStrategy):
         ("low",    "*",        "new_york"),
         ("low",    "neutral",  "asia"),
     ]
+    min_rr = 2.0
+    cooldown_bars = 6
+    default_fill_mode = "market"
 
     def __init__(self):
         self._prev_ofi: dict[str, float] = {}
@@ -135,6 +138,5 @@ class MultiTFScalpStrategy(BaseStrategy):
                             "flow_confirmation"],
             regime=regime,
             timestamp=ts,
-            fill_mode="market",
         )
-        return sig if sig.risk_reward() >= 2.0 else None
+        return self._finalize_signal(sig)

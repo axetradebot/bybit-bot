@@ -40,6 +40,25 @@ from src.strategies.base import BaseStrategy, SignalEvent, _sf, _valid
 class SniperStrategy(BaseStrategy):
     name = "sniper"
     blocked_regimes: list[tuple[str, str, str]] = []
+    # 5.4 R:R signature trade — guard against degraded setups.
+    min_rr = 4.0
+    # 6 bars (30 min on 5m / 90 min on 15m) — matches the historical
+    # best_filters_sim baseline.  cd=12 was a recent over-tightening that
+    # caused signal slippage past the trend ignition bar.
+    cooldown_bars = 6
+    default_fill_mode = "post_only"
+    # ── Partial-TP ladder DISABLED ──────────────────────────────────────
+    # Ablation v3 (reports/partial_tp_ablation_v3.txt) showed the ladder
+    # converts the historically positive Sniper edge into a -60% to -100%
+    # equity drain across all risk levels.  The mechanic is intuitive:
+    # Sniper's edge lives in the long-tail trail/TP3 winners (avg
+    # +11.98% raw); chopping 30% off at TP1 (+1.5R) and another 30% at
+    # TP2 (+3R) converts those rare moonshots into mediocre averages
+    # while still eating SL risk on the remaining 40%.  Single TP +
+    # trail (`None`) is the v1 baseline that produced the historical
+    # +2,445% post-filter sweep.
+    default_tp_ladder = None
+    move_be_on_tp1 = False
 
     def __init__(
         self,
@@ -185,7 +204,7 @@ class SniperStrategy(BaseStrategy):
         ts = pd.Timestamp(c.get("timestamp"))
         regime = self._compute_regime(atr_rank, funding_rate, ts)
 
-        return SignalEvent(
+        sig = SignalEvent(
             symbol=symbol,
             direction=direction,
             confidence=0.8,
@@ -197,5 +216,5 @@ class SniperStrategy(BaseStrategy):
             strategy_combo=["sniper", "ema_rejection", "multi_tf"],
             regime=regime,
             timestamp=ts,
-            fill_mode="limit",
         )
+        return self._finalize_signal(sig)

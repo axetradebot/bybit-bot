@@ -20,6 +20,13 @@ class VWAPReversionStrategy(BaseStrategy):
         # Mean reversion bleeds in high vol (worst USD/trade in backtest slice)
         ("high",   "*",        "*"),
     ]
+    min_rr = 1.8
+    cooldown_bars = 4
+    default_fill_mode = "post_only"
+    default_tp_ladder = (
+        (0.7, 0.50),     # take half just before VWAP
+        (1.0, 0.50),     # rest at VWAP
+    )
 
     def generate_signal(
         self,
@@ -95,6 +102,5 @@ class VWAPReversionStrategy(BaseStrategy):
                             "funding_neutral"],
             regime=regime,
             timestamp=ts,
-            fill_mode="limit",
         )
-        return sig if sig.risk_reward() >= 1.8 else None
+        return self._finalize_signal(sig)

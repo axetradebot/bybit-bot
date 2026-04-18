@@ -27,10 +27,21 @@ class VolumeDeltaLiqStrategy(BaseStrategy):
         ("medium", "neutral",  "off_hours"),
         ("high",   "neutral",  "new_york"),
     ]
+    min_rr = 2.0
+    cooldown_bars = 6
+    default_fill_mode = "market"   # breakouts need a taker fill
+
+    # Confidence boost when 1h liquidations exceed the rolling p95.
+    # We approximate p95 from a per-symbol rolling window inline since the
+    # full DB-backed percentile would mean a query per signal evaluation.
+    LIQ_HISTORY_WINDOW = 288       # 24 h of 5-min bars
+    LIQ_BOOST_QUANTILE = 0.95
+    LIQ_BOOST_AMOUNT = 0.10
 
     def __init__(self):
         self._history: dict[str, deque[dict]] = {}
         self._vol_history: dict[str, deque[float]] = {}
+        self._liq_history: dict[str, deque[float]] = {}
 
     def _snap(self, row: pd.Series) -> dict:
         return {
@@ -55,8 +66,10 @@ class VolumeDeltaLiqStrategy(BaseStrategy):
         if symbol not in self._history:
             self._history[symbol] = deque(maxlen=12)
             self._vol_history[symbol] = deque(maxlen=288)
+            self._liq_history[symbol] = deque(maxlen=self.LIQ_HISTORY_WINDOW)
         self._history[symbol].append(snap)
         self._vol_history[symbol].append(snap["volume"])
+        self._liq_history[symbol].append(max(0.0, _sf(liq_volume_1h)))
 
         if len(self._history[symbol]) < 6:
             return None
@@ -127,6 +140,20 @@ class VolumeDeltaLiqStrategy(BaseStrategy):
         conf = 0.60
         if vol_spike and abs(curr["volume_delta"]) > abs(prev["volume_delta"]):
             conf += 0.15
+
+        # Liquidation cluster boost — when the trailing 24h shows a
+        # liquidation flush AND the current bar is *still* elevated,
+        # the breakout typically has follow-through fuel.
+        liq_now = _sf(liq_volume_1h)
+        liq_hist = self._liq_history[symbol]
+        if liq_now > 0 and len(liq_hist) >= 30:
+            arr = np.array(liq_hist, dtype=float)
+            arr = arr[arr > 0]
+            if arr.size >= 10:
+                p95 = float(np.quantile(arr, self.LIQ_BOOST_QUANTILE))
+                if liq_now >= p95:
+                    conf += self.LIQ_BOOST_AMOUNT
+
         conf = min(conf, 1.0)
 
         ts = pd.Timestamp(c.get("timestamp"))
@@ -148,6 +175,5 @@ class VolumeDeltaLiqStrategy(BaseStrategy):
                             "consolidation_break"],
             regime=regime,
             timestamp=ts,
-            fill_mode="market",
         )
-        return sig if sig.risk_reward() >= 2.0 else None
+        return self._finalize_signal(sig)

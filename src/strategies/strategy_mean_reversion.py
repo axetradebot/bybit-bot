@@ -30,6 +30,18 @@ class MeanReversionStrategy(BaseStrategy):
     blocked_regimes: list[tuple[str, str, str]] = [
         ("high", "*", "*"),
     ]
+    # Mean-reversion legitimately runs at lower R:R; the global
+    # 1.5 floor used to silently kill ~all of these signals.
+    min_rr = 1.0
+    # Mean-reversion is faster to recycle setups than momentum strats.
+    cooldown_bars = 4
+    # Limit-only entries make sense for fading extremes; partial TPs
+    # at 1R / BB-mid / runner.
+    default_fill_mode = "post_only"
+    default_tp_ladder = (
+        (0.5, 0.50),     # take half at half-R (we're fading, not chasing)
+        (1.0, 0.50),     # rest at 1R (which is typically BB-mid)
+    )
 
     ADX_CEILING = 20
     RSI_OVERSOLD = 30
@@ -139,7 +151,7 @@ class MeanReversionStrategy(BaseStrategy):
         if not self._regime_allowed(regime):
             return None
 
-        return SignalEvent(
+        sig = SignalEvent(
             symbol=symbol,
             direction=direction,
             confidence=conf,
@@ -151,6 +163,7 @@ class MeanReversionStrategy(BaseStrategy):
             strategy_combo=["mean_reversion", "bb_fade", "rsi_extreme"],
             regime=regime,
             timestamp=ts,
-            fill_mode="limit",
             risk_pct=self.RISK_PCT,
+            min_rr=self.MIN_RR,
         )
+        return self._finalize_signal(sig)

@@ -37,6 +37,19 @@ from src.strategies.base import BaseStrategy, SignalEvent, _sf, _valid
 class HighWinRateStrategy(BaseStrategy):
     name = "high_winrate"
     blocked_regimes: list[tuple[str, str, str]] = []
+    # 4 R:R is the strategy's signature — the global 1.5 floor is
+    # already cleared trivially.  Override min_rr=4.0 so the rr_gate
+    # blocks any degraded setup before it reaches the order manager.
+    min_rr = 4.0
+    cooldown_bars = 6
+    default_fill_mode = "post_only"
+    # Asymmetric ladder matched to the 4:1 payoff: protect the win
+    # quickly without capping the runner.
+    default_tp_ladder = (
+        (1.5, 0.30),
+        (3.0, 0.30),
+        (5.0, 0.20),
+    )
 
     def __init__(self):
         self._prev_close: dict[str, float] = {}
@@ -180,7 +193,7 @@ class HighWinRateStrategy(BaseStrategy):
 
         conf = (score / n_filters) if n_filters > 0 else 0.5
 
-        return SignalEvent(
+        sig = SignalEvent(
             symbol=symbol,
             direction=direction,
             confidence=conf,
@@ -193,5 +206,5 @@ class HighWinRateStrategy(BaseStrategy):
                             "ema_pullback"],
             regime=regime,
             timestamp=ts,
-            fill_mode="limit",
         )
+        return self._finalize_signal(sig)

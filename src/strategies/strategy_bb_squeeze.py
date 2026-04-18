@@ -23,6 +23,9 @@ class BBSqueezeStrategy(BaseStrategy):
         ("high",   "negative", "asia"),
         ("low",    "positive", "off_hours"),
     ]
+    min_rr = 2.0
+    cooldown_bars = 6
+    default_fill_mode = "market"
 
     def __init__(self):
         self._prev: dict[str, dict] = {}
@@ -133,6 +136,5 @@ class BBSqueezeStrategy(BaseStrategy):
             strategy_combo=["bb_squeeze", "ema_trend", "macd_momentum", "vwap_filter"],
             regime=regime,
             timestamp=ts,
-            fill_mode="market",
         )
-        return sig if sig.risk_reward() >= 2.0 else None
+        return self._finalize_signal(sig)

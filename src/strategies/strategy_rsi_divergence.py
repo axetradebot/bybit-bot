@@ -23,6 +23,9 @@ from src.strategies.base import BaseStrategy, SignalEvent, _sf, _valid
 
 class RSIDivergenceStrategy(BaseStrategy):
     name = "rsi_divergence"
+    min_rr = 2.0
+    cooldown_bars = 8                  # divergences cluster — slow recycle
+    default_fill_mode = "post_only"    # we have time, take the maker fee
 
     def __init__(self):
         self._history: dict[str, deque[dict]] = {}
@@ -160,6 +163,5 @@ class RSIDivergenceStrategy(BaseStrategy):
             strategy_combo=["rsi_div", "supertrend_flip", "ema_slope"],
             regime=regime,
             timestamp=ts,
-            fill_mode="limit",
         )
-        return sig if sig.risk_reward() >= 2.0 else None
+        return self._finalize_signal(sig)
