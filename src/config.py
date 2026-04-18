@@ -39,6 +39,11 @@ class Settings(BaseSettings):
 
     telegram_bot_token: str = Field("", env="TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str = Field("", env="TELEGRAM_CHAT_ID")
+    # Hourly status messages are off by default; trade fills, signal
+    # alerts, and blocked-signal pings still fire when telegram is set.
+    telegram_hourly_status: bool = Field(
+        False, env="TELEGRAM_HOURLY_STATUS"
+    )
 
     # Optional: CoinGlass Crypto API (see src/data/coinglass_liquidation.py)
     coinglass_api_key: str = Field("", env="COINGLASS_API_KEY")

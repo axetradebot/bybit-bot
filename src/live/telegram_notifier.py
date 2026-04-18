@@ -323,8 +323,18 @@ class TelegramNotifier:
     # ------------------------------------------------------------------
 
     def start_hourly_loop(self, exchange: Any = None) -> None:
-        """Start a daemon thread that sends status every hour."""
+        """Start a daemon thread that sends status every hour.
+
+        No-op unless both the bot is enabled AND
+        ``settings.telegram_hourly_status`` is true.  Trade fills,
+        signal alerts, and blocked-signal notifications are unaffected
+        and continue firing as long as Telegram credentials are set.
+        """
         if not self._enabled:
+            return
+        if not settings.telegram_hourly_status:
+            log.info("telegram_hourly_loop_disabled",
+                     reason="TELEGRAM_HOURLY_STATUS=false")
             return
 
         def _loop():
