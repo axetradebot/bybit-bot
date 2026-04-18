@@ -1,0 +1,19 @@
+[Unit]
+Description=Run CoinGlass liquidation sync every 4h (matches Hobbyist data granularity)
+
+[Timer]
+# Run 5 minutes after every 4-hour boundary so the new bucket has had a
+# moment to publish on CoinGlass.  CoinGlass aggregated buckets close at
+# 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC.
+OnCalendar=*-*-* 00,04,08,12,16,20:05:00 UTC
+
+# If the machine was off when a tick fired, run as soon as we're back.
+Persistent=true
+
+# Avoid all 8 symbols hitting CoinGlass at exactly the same wall-clock
+# second across multiple boxes (harmless on a single box, hygienic if we
+# ever scale).
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

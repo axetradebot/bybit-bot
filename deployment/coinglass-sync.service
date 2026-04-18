@@ -1,0 +1,20 @@
+[Unit]
+Description=Bybit Bot – CoinGlass aggregated liquidation sync
+After=network-online.target docker.service
+Wants=network-online.target
+
+# Don't start the sync if the DB container isn't up.
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/opt/bybit_bot
+Environment=PYTHONPATH=/opt/bybit_bot
+ExecStart=/opt/bybit_bot/.venv/bin/python /opt/bybit_bot/scripts/sync_coinglass_liquidations.py
+StandardOutput=journal
+StandardError=journal
+
+# CoinGlass Hobbyist tier = 30 RPM.  8 symbols * 1 call = ~10 s of API
+# work; allow a generous margin for retries on rate-limit hits.
+TimeoutStartSec=180

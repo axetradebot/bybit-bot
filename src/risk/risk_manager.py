@@ -86,6 +86,22 @@ class RiskManager:
         "sniper", "multitf_scalp", "high_winrate", "volume_delta_liq",
     })
 
+    # ── CoinGlass headwind block (Apr-2026 attribution analysis) ──
+    # Origin:  scripts/coinglass_attribution.py — direction-conditional
+    # bucketing of 659 live-aligned Sniper trades over Nov-2025 → Apr-2026.
+    # Threshold sweep dominated by 0.20:
+    #   thr=0.20: blocks 108 trades, mean R +0.074 → +0.242, +172.4% PnL
+    #   thr=0.30: blocks  91 trades, mean R +0.074 → +0.211, +145.4% PnL
+    #   thr=0.40: blocks  79 trades, mean R +0.074 → +0.186, +120.0% PnL
+    # Both HEADWIND (n=91, t=-10.06) and MILD_HEAD (n=30, t=-6.73) buckets
+    # are statistically conclusive; threshold 0.20 captures both for the
+    # maximum out-of-sample PnL uplift.  Tunable so we can revisit once
+    # Startup-tier (30m granularity) liquidation data is available.
+    CG_HEADWIND_THRESHOLD = 0.20
+    CG_HEADWIND_GATE_STRATEGIES = frozenset({
+        "sniper", "multitf_scalp", "high_winrate",
+    })
+
     def __init__(
         self,
         is_backtest: bool = True,
@@ -142,6 +158,8 @@ class RiskManager:
           4.  session_open_gate         (avoid funding-fix windows)
           5.  funding_proximity_gate    (skip trades right before fix when adverse)
           5b. chop_gate                 (NEW-6 anti-chop, trend strategies only)
+          5c. cg_headwind_gate          (block when CoinGlass liq-imb opposes
+                                         trade direction by >= 0.20)
           6.  bayesian_regime_gate      (data-driven regime block)
           7.  funding_expectancy_gate   (cost > 50% of expected edge?)
           8.  funding_gate              (legacy hard funding cap)
@@ -207,6 +225,12 @@ class RiskManager:
         # Gate 5b — NEW-6 anti-chop filter (trend-strategies only)
         if self._chop_gate(approved):
             self._record_blocked(signal, "chop_filter")
+            return None
+
+        # Gate 5c — CoinGlass liquidation-imbalance HEADWIND block
+        # (trend-strategies only; fail-open when cg_liq_imb missing)
+        if self._cg_headwind_gate(approved):
+            self._record_blocked(signal, "cg_headwind_gate")
             return None
 
         # Gate 6 — Bayesian regime filter
@@ -349,6 +373,53 @@ class RiskManager:
         if snap.get("bb_squeeze") is True:
             return True
 
+        return False
+
+    def _cg_headwind_gate(self, signal: SignalEvent) -> bool:
+        """CoinGlass liquidation-imbalance HEADWIND gate.
+
+        Returns True to BLOCK when ``cg_liq_imb`` (loaded from CoinGlass
+        4h aggregated long/short liquidation-USD totals) is pointing
+        strongly against the trade direction:
+
+          * long  + cg_liq_imb <= -CG_HEADWIND_THRESHOLD  → BLOCK
+            (the market is liquidating *long* positions in size; chasing
+            another long is the historically worst possible bet —
+            HEADWIND bucket had mean R = -0.78, t = -10 over n=91 trades;
+            MILD_HEAD added another mean R = -0.89, t = -6.7, n=30)
+          * short + cg_liq_imb >= +CG_HEADWIND_THRESHOLD → BLOCK
+            (mirror case: mass short liquidations are bullish
+            capitulation, not a place to add fresh shorts)
+
+        Fail-open when the snapshot has no ``cg_liq_imb`` value — that
+        happens when the CoinGlass sync hasn't run, the symbol has no
+        recent liquidation data, or the bar predates our coverage.
+        We never want a missing-data condition to stall the bot.
+        """
+        head = (signal.strategy_combo or [""])[0]
+        if head not in self.CG_HEADWIND_GATE_STRATEGIES:
+            return False
+
+        snap = signal.indicators_snapshot or {}
+        # build_indicator_snapshot keeps the per-bar ``extras`` dict as
+        # a sub-key (CoinGlass features live there).  The live path
+        # populates it from the indicators_5m row.
+        extras = snap.get("extras") or {}
+        imb_raw = extras.get("cg_liq_imb")
+        if imb_raw is None:
+            return False
+        try:
+            imb = float(imb_raw)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(imb):
+            return False
+
+        threshold = self.CG_HEADWIND_THRESHOLD
+        if signal.direction == "long" and imb <= -threshold:
+            return True
+        if signal.direction == "short" and imb >= threshold:
+            return True
         return False
 
     def _max_positions_gate(
