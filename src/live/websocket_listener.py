@@ -68,6 +68,14 @@ log = structlog.get_logger()
 # Minimum buffer length before we start running indicators / strategies
 _MIN_BUFFER = 20
 
+# When loading the bar buffer from candles_5m, we accept the DB result
+# only if it has at least this many rows.  Anything less is treated as
+# stale or corrupt (e.g. a single leftover row from a backfill test) and
+# we fall through to Bybit REST for a fresh 5000-bar download.  1500
+# 5m-bars = ~5 days of history, comfortably covers the EMA-200 / 1h
+# context needs and leaves the 4h sniper to warm up over the first day.
+_MIN_DB_BUFFER_ROWS = 1500
+
 # ---------------------------------------------------------------------------
 # Anti-chop filter — blocks signals in low-quality / choppy conditions.
 # Bear-market-optimised: ADX>=25 + DI aligned + BB mid side + volume >= 2.0x.
@@ -303,7 +311,15 @@ class WebSocketListener:
         return None
 
     def _init_buffer(self, symbol: str) -> None:
-        """Pre-fill bar buffer from DB, falling back to Bybit REST API."""
+        """Pre-fill bar buffer from DB, falling back to Bybit REST API.
+
+        DB load requires at least ``_MIN_DB_BUFFER_ROWS`` rows; anything
+        less is treated as a stale leftover (e.g. one test write) and we
+        fall through to the Bybit REST fetch.  Without this guard a
+        single row in candles_5m would make the bot accept a 1-bar
+        buffer and then take ~16 days of live data to accumulate enough
+        history to compute 4h indicators (the WIFUSDT regression).
+        """
         loaded = False
 
         # Try DB first
@@ -315,12 +331,17 @@ class WebSocketListener:
                 params={"symbol": symbol, "n": _BUFFER_SIZE},
                 parse_dates=["timestamp"],
             )
-            if not df.empty:
+            if len(df) >= _MIN_DB_BUFFER_ROWS:
                 for _, row in df.sort_values("timestamp").iterrows():
                     self._bar_buffer[symbol].append(row.to_dict())
                 log.info("buffer_from_db",
                          symbol=symbol, bars=len(df))
                 loaded = True
+            elif not df.empty:
+                log.info("buffer_from_db_insufficient",
+                         symbol=symbol, bars=len(df),
+                         min_required=_MIN_DB_BUFFER_ROWS,
+                         action="falling back to Bybit REST")
         except Exception:
             pass
 
