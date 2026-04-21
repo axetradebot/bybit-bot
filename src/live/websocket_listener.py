@@ -77,42 +77,17 @@ _MIN_BUFFER = 20
 _MIN_DB_BUFFER_ROWS = 1500
 
 # ---------------------------------------------------------------------------
-# Anti-chop filter — blocks signals in low-quality / choppy conditions.
-# Bear-market-optimised: ADX>=25 + DI aligned + BB mid side + volume >= 2.0x.
-# Profitable in both 2023 bear and late-2025/2026 crash windows.
+# Anti-chop filtering is now applied EXCLUSIVELY by RiskManager._chop_gate
+# (the sim-validated NEW-6 filter: DI + BB mid + vol >= 1.2 + no squeeze).
+#
+# A previous "bear-market-optimised" filter lived here with stricter
+# thresholds (ADX >= 25, vol >= 2.0) that were never validated by
+# simulation.  Telemetry showed it was blocking ~63% of live signals
+# with chop_filter:adx_too_low — single-handedly responsible for the
+# bot generating zero trades in 24h.  The +172% PnL sim was based on
+# the looser RiskManager gate alone, so this duplicate has been removed.
+# Strategies still get full chop protection via risk_manager.evaluate().
 # ---------------------------------------------------------------------------
-_CHOP_FILTER_ADX_FLOOR = 25
-_CHOP_FILTER_VOL_FLOOR = 2.0
-_CHOP_FILTER_EXEMPT: frozenset[str] = frozenset({"mean_reversion"})
-
-
-def _passes_chop_filter(bar: pd.Series, direction: str) -> tuple[bool, str]:
-    """Return (passes, reason) — reason is empty when it passes."""
-    adx = _sf(bar.get("adx_14"))
-    if adx > 0 and adx < _CHOP_FILTER_ADX_FLOOR:
-        return False, "chop_filter:adx_too_low"
-
-    plus_di = _sf(bar.get("plus_di"))
-    minus_di = _sf(bar.get("minus_di"))
-    if plus_di > 0 or minus_di > 0:
-        if direction == "long" and plus_di <= minus_di:
-            return False, "chop_filter:di_not_aligned"
-        if direction == "short" and minus_di <= plus_di:
-            return False, "chop_filter:di_not_aligned"
-
-    bb_mid = _sf(bar.get("bb_mid"))
-    close = _sf(bar.get("close"))
-    if bb_mid > 0 and close > 0:
-        if direction == "long" and close <= bb_mid:
-            return False, "chop_filter:wrong_side_bb_mid"
-        if direction == "short" and close >= bb_mid:
-            return False, "chop_filter:wrong_side_bb_mid"
-
-    vol_ratio = _sf(bar.get("volume_ratio"))
-    if vol_ratio > 0 and vol_ratio < _CHOP_FILTER_VOL_FLOOR:
-        return False, "chop_filter:low_volume"
-
-    return True, ""
 
 
 # Bars to keep in memory per symbol (5000 = ~17 days of 5m bars, enough for 4h indicators)
@@ -929,23 +904,9 @@ class WebSocketListener:
                      result="flat", reject=reject or "unspecified")
             return
 
-        passes, chop_reason = _passes_chop_filter(trading_row, signal.direction)
-        if not passes:
-            log.info("sniper_chop_filtered",
-                     symbol=symbol, tf=tf,
-                     direction=signal.direction, reason=chop_reason)
-            self.state.add_blocked({
-                "symbol": symbol,
-                "strategy": f"sniper_{tf}",
-                "direction": signal.direction,
-                "reason": chop_reason,
-                "timestamp": signal.timestamp.isoformat(),
-            })
-            self.telegram.notify_blocked(
-                symbol=symbol, strategy=f"sniper_{tf}",
-                direction=signal.direction, reason=chop_reason,
-            )
-            return
+        # Chop filtering is delegated to risk_manager.evaluate() below
+        # (sim-validated NEW-6 logic).  See header comment near the
+        # listener-level constants for why this pre-filter was removed.
 
         log.info("sniper_signal",
                  symbol=symbol, tf=tf,
@@ -1180,19 +1141,11 @@ class WebSocketListener:
                                  result="flat", reject=reject)
                     continue
 
-                passes, chop_reason = _passes_chop_filter(ind_5m, signal.direction)
-                if not passes and strategy.name not in _CHOP_FILTER_EXEMPT:
-                    log.info("strategy_chop_filtered",
-                             symbol=symbol, strategy=strategy.name,
-                             direction=signal.direction, reason=chop_reason)
-                    self.state.add_blocked({
-                        "symbol": symbol,
-                        "strategy": strategy.name,
-                        "direction": signal.direction,
-                        "reason": chop_reason,
-                        "timestamp": signal.timestamp.isoformat(),
-                    })
-                    continue
+                # Chop filtering is delegated to risk_manager.evaluate()
+                # below (sim-validated NEW-6 logic).  The ad-hoc
+                # listener-level filter that used to be here was
+                # blocking ~63% of valid signals with a stricter,
+                # never-validated ADX/vol threshold.
 
                 self._refresh_equity_if_stale()
                 positions = self.order_manager.sync_positions()
