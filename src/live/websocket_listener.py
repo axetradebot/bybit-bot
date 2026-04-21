@@ -162,7 +162,16 @@ class WebSocketListener:
         self.state = state
 
         self._bar_buffer: dict[str, deque] = {}
-        self._db_unavailable: bool = False
+        # Soft circuit-breaker for DB writes.  When a write fails we
+        # back off for a cool-down (exponential, capped at 10 min) and
+        # automatically retry afterwards.  Previously a single transient
+        # error permanently disabled writes for the process lifetime,
+        # which silently truncated candle history (SOL had only 355 rows
+        # after days of running) and forced every restart to re-fetch
+        # 5000 bars per symbol from Bybit REST.
+        self._db_unavailable_until: float = 0.0
+        self._db_backoff_seconds: float = 30.0
+        self._db_backoff_max: float = 600.0  # 10 min cap
         self._latest_funding: dict[str, float] = {}
         self._predicted_funding: dict[str, float] = {}
         self._latest_mark: dict[str, float] = {}
@@ -720,8 +729,30 @@ class WebSocketListener:
 
     # ----- DB writes ----------------------------------------------------
 
+    def _db_writes_paused(self) -> bool:
+        """True iff the circuit-breaker is currently open."""
+        return time.time() < self._db_unavailable_until
+
+    def _db_record_success(self) -> None:
+        """Reset the breaker after a successful write."""
+        if self._db_unavailable_until or self._db_backoff_seconds > 30.0:
+            log.info("db_writes_recovered",
+                     prior_backoff=self._db_backoff_seconds)
+        self._db_unavailable_until = 0.0
+        self._db_backoff_seconds = 30.0
+
+    def _db_record_failure(self, error: str) -> None:
+        """Open the breaker with exponential back-off (capped)."""
+        self._db_unavailable_until = time.time() + self._db_backoff_seconds
+        log.warning("db_writes_paused",
+                    cooldown_s=self._db_backoff_seconds,
+                    error=error[:200])
+        self._db_backoff_seconds = min(
+            self._db_backoff_seconds * 2.0, self._db_backoff_max,
+        )
+
     def _write_candle(self, bar: dict) -> None:
-        if self._db_unavailable:
+        if self._db_writes_paused():
             return
         try:
             record = {k: v for k, v in bar.items()}
@@ -735,15 +766,14 @@ class WebSocketListener:
             )
             with self._engine.begin() as conn:
                 conn.execute(stmt)
-        except Exception:
-            self._db_unavailable = True
-            log.warning("db_writes_disabled",
-                        reason="connection failed, skipping future writes")
+            self._db_record_success()
+        except Exception as exc:
+            self._db_record_failure(str(exc))
 
     def _write_indicator_row(
         self, symbol: str, row: pd.Series, model: type,
     ) -> None:
-        if self._db_unavailable:
+        if self._db_writes_paused():
             return
         try:
             rec: dict = {
@@ -773,8 +803,9 @@ class WebSocketListener:
             )
             with self._engine.begin() as conn:
                 conn.execute(stmt)
-        except Exception:
-            self._db_unavailable = True
+            self._db_record_success()
+        except Exception as exc:
+            self._db_record_failure(str(exc))
 
     @staticmethod
     def _safe(val: Any) -> float | None:
