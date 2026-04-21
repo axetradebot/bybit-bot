@@ -784,16 +784,26 @@ class WebSocketListener:
     def _compute_tf_indicators(
         self, symbol: str, target_tf: str,
     ) -> pd.Series | None:
-        """Build higher-TF indicators from the in-memory bar buffer."""
+        """Build higher-TF indicators from the in-memory bar buffer.
+
+        Returns None when there isn't enough history yet.  All return-None
+        paths log a debug-level reason so we can diagnose intermittent
+        ``sniper_tf_no_data`` warnings (notably SOL/BTC at 4h boundaries).
+        """
         lookback = self._TF_LOOKBACK.get(target_tf, 3000)
         try:
             buf = self._bar_buffer.get(symbol)
             if not buf or len(buf) < 100:
+                log.debug("tf_indicator_buffer_short",
+                          symbol=symbol, tf=target_tf,
+                          buf_len=len(buf) if buf else 0)
                 return None
 
             bars = list(buf)[-lookback:]
             df_5m = pd.DataFrame(bars)
             if "timestamp" not in df_5m.columns or len(df_5m) < 100:
+                log.debug("tf_indicator_df_short",
+                          symbol=symbol, tf=target_tf, rows=len(df_5m))
                 return None
 
             df_5m["timestamp"] = pd.to_datetime(df_5m["timestamp"], utc=True)
@@ -804,6 +814,12 @@ class WebSocketListener:
 
             resampled = resample_candles(df_5m, target_tf)
             if len(resampled) < 20:
+                log.warning("tf_indicator_resample_short",
+                            symbol=symbol, tf=target_tf,
+                            df_5m_rows=len(df_5m),
+                            resampled_rows=len(resampled),
+                            buf_first=str(df_5m["timestamp"].iloc[0]),
+                            buf_last=str(df_5m["timestamp"].iloc[-1]))
                 return None
 
             with_ta = compute_ta_indicators(resampled)
@@ -856,7 +872,9 @@ class WebSocketListener:
         )
 
         if signal is None or signal.direction == "flat":
-            log.info("sniper_eval", symbol=symbol, tf=tf, result="flat")
+            reject = getattr(strategy, "_last_reject_reason", None)
+            log.info("sniper_eval", symbol=symbol, tf=tf,
+                     result="flat", reject=reject or "unspecified")
             return
 
         passes, chop_reason = _passes_chop_filter(trading_row, signal.direction)
@@ -1099,6 +1117,15 @@ class WebSocketListener:
                 )
 
                 if signal is None or signal.direction == "flat":
+                    # Log rejection reason if the strategy exposes one
+                    # (Sniper does — see _last_reject_reason).  Keeps
+                    # the 5m loop visible without being chatty: only
+                    # logs when a reason is set.
+                    reject = getattr(strategy, "_last_reject_reason", None)
+                    if reject:
+                        log.info("strategy_eval",
+                                 symbol=symbol, strategy=strategy.name,
+                                 result="flat", reject=reject)
                     continue
 
                 passes, chop_reason = _passes_chop_filter(ind_5m, signal.direction)

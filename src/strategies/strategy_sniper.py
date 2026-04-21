@@ -84,6 +84,21 @@ class SniperStrategy(BaseStrategy):
         self.ema_touch_slack = ema_touch_slack
         self._prev_close: float | None = None
         self._prev_ema21: float | None = None
+        # Diagnostic: short string identifying which condition caused
+        # the most-recent generate_signal() to return None.  Read by the
+        # WebSocket listener so "no entries today" becomes "27 trades
+        # rejected at rsi_band, 12 at chop, 4 at ctx_no_trend" — instead
+        # of an opaque silence.  Set just before every return None below.
+        self._last_reject_reason: str | None = None
+
+    def _reject(self, reason: str) -> None:
+        """Mark why we're rejecting this bar and return None.
+
+        Centralised so we never forget to tag a rejection point — the
+        diagnostic value is wholly dependent on every code path being
+        traceable back to a named reason.
+        """
+        self._last_reject_reason = reason
 
     def generate_signal(
         self,
@@ -111,17 +126,21 @@ class SniperStrategy(BaseStrategy):
         self._prev_ema21 = ema21
 
         if prev_close is None or prev_ema21 is None:
+            self._reject("warmup_no_prev")
             return None
         if atr <= 0 or close <= 0 or ema21 <= 0:
+            self._reject("invalid_price_or_atr")
             return None
 
         required = ("ema_9", "ema_21", "ema_50", "rsi_14",
                      "supertrend_dir", "ha_close", "ha_open")
         if not all(_valid(c.get(k)) for k in required):
+            self._reject("missing_indicators")
             return None
 
         # ── Context TF: higher-TF trend confirmation ───────
         if not (_valid(ctx.get("ema_9")) and _valid(ctx.get("ema_21"))):
+            self._reject("ctx_indicators_missing")
             return None
 
         ctx_ema9 = _sf(ctx.get("ema_9"))
@@ -131,6 +150,7 @@ class SniperStrategy(BaseStrategy):
         ctx_long = ctx_ema9 > ctx_ema21 and ctx_st > 0
         ctx_short = ctx_ema9 < ctx_ema21 and ctx_st < 0
         if not (ctx_long or ctx_short):
+            self._reject("ctx_no_trend")
             return None
 
         # ── Trading TF: full EMA stack ─────────────────────
@@ -142,11 +162,13 @@ class SniperStrategy(BaseStrategy):
         elif ctx_short and short_stack:
             direction = "short"
         else:
+            self._reject("ema_stack_misaligned")
             return None
 
         # ── EMA separation -- trend must be established ────
         ema_spread = abs(ema9 - ema50) / ema50
         if ema_spread < self.ema_spread_min:
+            self._reject("ema_spread_too_tight")
             return None
 
         # ── Trigger: EMA-21 rejection candle ───────────────
@@ -154,41 +176,56 @@ class SniperStrategy(BaseStrategy):
         slack_lo = 1.0 - self.ema_touch_slack
         if direction == "long":
             if prev_close <= prev_ema21:
+                self._reject("prev_below_ema21")
                 return None
             if not (low <= ema21 * slack_hi and close > ema21):
+                self._reject("no_ema21_rejection_long")
                 return None
         else:
             if prev_close >= prev_ema21:
+                self._reject("prev_above_ema21")
                 return None
             if not (high >= ema21 * slack_lo and close < ema21):
+                self._reject("no_ema21_rejection_short")
                 return None
 
         # ── RSI: healthy pullback zone ─────────────────────
         rsi = _sf(c.get("rsi_14"))
         if direction == "long" and not (self.rsi_long_lo <= rsi <= self.rsi_long_hi):
+            self._reject("rsi_band_miss_long")
             return None
         if direction == "short" and not (self.rsi_short_lo <= rsi <= self.rsi_short_hi):
+            self._reject("rsi_band_miss_short")
             return None
 
         # ── Heikin-Ashi confirms reversal ──────────────────
         ha_close = _sf(c.get("ha_close"))
         ha_open = _sf(c.get("ha_open"))
         if direction == "long" and ha_close <= ha_open:
+            self._reject("ha_disagree_long")
             return None
         if direction == "short" and ha_close >= ha_open:
+            self._reject("ha_disagree_short")
             return None
 
         # ── Supertrend on trading TF ───────────────────────
         st_dir = _sf(c.get("supertrend_dir"))
         if direction == "long" and st_dir <= 0:
+            self._reject("st_disagree_long")
             return None
         if direction == "short" and st_dir >= 0:
+            self._reject("st_disagree_short")
             return None
 
         # ── Minimum volatility ─────────────────────────────
         atr_rank = _sf(c.get("atr_pct_rank"))
         if atr_rank < self.atr_rank_floor:
+            self._reject("atr_rank_too_low")
             return None
+
+        # All gates passed — clear the rejection cache so the diagnostic
+        # field never shows a stale reason next to a fired signal.
+        self._last_reject_reason = None
 
         # ── Risk: SL / TP via ATR multiples ────────────────
         sl_dist = self.sl_atr_mult * atr
