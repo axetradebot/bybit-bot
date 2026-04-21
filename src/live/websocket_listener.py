@@ -619,6 +619,14 @@ class WebSocketListener:
                      ts=bar["timestamp"].isoformat(),
                      close=bar["close"])
 
+            # Refresh equity on every confirmed bar (default 5-min TTL).
+            # Critical for cross-margin / multi-asset collateral, where
+            # equity drifts in real time as ETH/SOL/BTC prices move.
+            # Previously this was only called inside _run_strategies after
+            # a non-flat signal, so during quiet markets the equity could
+            # stay stale for many hours.
+            self._refresh_equity_if_stale()
+
             self._run_strategies(symbol, ind_5m, ind_15m)
 
             # Higher-TF sniper: detect when 15m / 4h bars close
