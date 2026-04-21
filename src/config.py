@@ -23,6 +23,21 @@ class Settings(BaseSettings):
     bybit_api_secret: str = Field("", env="BYBIT_API_SECRET")
     bybit_testnet: bool = Field(True, env="BYBIT_TESTNET")
     bybit_demo: bool = Field(False, env="BYBIT_DEMO")
+    # Margin mode for opening positions.  Two valid values:
+    #   "isolated" — bot calls set_margin_mode("isolated", symbol) before
+    #                every entry.  Each position is fully ring-fenced;
+    #                only the position's own margin can be liquidated.
+    #   "cross"    — bot SKIPS the per-symbol margin-mode call and relies
+    #                on the account-level cross/portfolio-margin setting
+    #                you've configured manually in Bybit (UTA).  Required
+    #                when collateral is held as a multi-asset basket
+    #                (BTC / ETH / SOL alongside USDT) so coins appreciate
+    #                with the market.  Position-sizing math is identical
+    #                because total_equity is already USD-equivalent in
+    #                UTA, but cross shares the entire account's equity
+    #                across all open positions — a single flash crash
+    #                can take more than one position with it.
+    bybit_margin_mode: str = Field("cross", env="BYBIT_MARGIN_MODE")
 
     live_strategy: str = Field("all", env="LIVE_STRATEGY")
     live_equity: float = Field(1_000.0, env="LIVE_EQUITY")

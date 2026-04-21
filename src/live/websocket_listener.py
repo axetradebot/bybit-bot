@@ -247,7 +247,17 @@ class WebSocketListener:
             self._equity_last_refresh = time.time()
 
     def _fetch_live_equity(self) -> float | None:
-        """Query Bybit for total margin balance so position sizing uses the real equity."""
+        """Query Bybit UTA for USD-equivalent total equity.
+
+        ``totalEquity`` already aggregates multi-asset collateral
+        (USDT + BTC + ETH + SOL + …) into a single USD figure using
+        Bybit's index prices, so position sizing remains correct when
+        the user holds part of the basket as crypto.
+
+        Also logs the per-asset breakdown (asset, qty, USD value) so
+        you can see how much of equity is in each coin — useful when
+        running on cross margin with a multi-asset collateral basket.
+        """
         exchange = self.order_manager._exchange
         if exchange is None:
             return None
@@ -261,11 +271,28 @@ class WebSocketListener:
                 total_equity = float(acct.get("totalEquity", 0) or 0)
                 margin_balance = float(acct.get("totalMarginBalance", 0) or 0)
                 equity = total_equity or margin_balance
+
+                # Per-asset breakdown for multi-collateral visibility
+                breakdown: dict[str, dict[str, float]] = {}
+                for c in acct.get("coin", []) or []:
+                    coin = c.get("coin")
+                    qty = float(c.get("walletBalance") or 0)
+                    usd = float(c.get("usdValue") or 0)
+                    if coin and abs(usd) > 0.5:
+                        breakdown[coin] = {
+                            "qty": round(qty, 6),
+                            "usd": round(usd, 2),
+                        }
+
                 if equity > 0:
-                    log.info("live_equity_fetched",
-                             total_equity=total_equity,
-                             margin_balance=margin_balance,
-                             using=equity)
+                    log.info(
+                        "live_equity_fetched",
+                        total_equity=round(total_equity, 2),
+                        margin_balance=round(margin_balance, 2),
+                        using=round(equity, 2),
+                        margin_mode=(settings.bybit_margin_mode or "cross"),
+                        collateral=breakdown or None,
+                    )
                     return equity
             fallback = float(balance.get("total", {}).get("USDT", 0) or 0)
             if fallback > 0:

@@ -203,15 +203,25 @@ class OrderManager:
         ccxt_sym = _to_ccxt_symbol(signal.symbol)
 
         leverage = signal.leverage or 20
-        try:
-            self._exchange.set_margin_mode("isolated", ccxt_sym)
-        except Exception as exc:
-            log.warning("set_margin_mode_failed", symbol=signal.symbol,
-                        error=str(exc))
+
+        # Margin mode: only set per-symbol when the user has explicitly
+        # opted into "isolated".  In "cross"/UTA mode the account-level
+        # setting wins and Bybit will reject per-symbol switches with
+        # error 110025 / "margin mode cannot be modified".  We honour
+        # the BYBIT_MARGIN_MODE setting and skip the call entirely when
+        # cross is requested — the account is already in cross.
+        margin_mode = (settings.bybit_margin_mode or "cross").lower()
+        if margin_mode == "isolated":
+            try:
+                self._exchange.set_margin_mode("isolated", ccxt_sym)
+            except Exception as exc:
+                log.warning("set_margin_mode_failed",
+                            symbol=signal.symbol, mode="isolated",
+                            error=str(exc))
         try:
             self._exchange.set_leverage(leverage, ccxt_sym)
             log.info("leverage_set", symbol=signal.symbol,
-                     leverage=leverage, margin="isolated")
+                     leverage=leverage, margin=margin_mode)
         except Exception as exc:
             log.warning("set_leverage_failed", symbol=signal.symbol,
                         leverage=leverage, error=str(exc))
