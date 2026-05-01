@@ -102,6 +102,20 @@ class RiskManager:
         "sniper", "multitf_scalp", "high_winrate",
     })
 
+    # ── Post-impulse cooldown (Apr-2026 live forensics) ──
+    # In the first 11 days of live Sniper trading, 75% of longs and 67%
+    # of shorts were opened after a >1.5% move over the previous 30 min,
+    # producing -$80 (long) and -$84 (short) realised PnL out of -$278
+    # total.  The chase pattern is the dominant failure mode regardless
+    # of trade direction.  We block any trend-strategy entry when
+    # |move_pct_30m| exceeds POST_IMPULSE_BLOCK_PCT.  Mean-rev /
+    # squeeze plays are exempt for the same reason chop_filter is —
+    # they intentionally enter into impulses.
+    POST_IMPULSE_BLOCK_PCT = 0.015
+    POST_IMPULSE_GATE_STRATEGIES = frozenset({
+        "sniper", "multitf_scalp", "high_winrate", "volume_delta_liq",
+    })
+
     def __init__(
         self,
         is_backtest: bool = True,
@@ -130,8 +144,10 @@ class RiskManager:
     # Public helpers used by the live listener
     # ------------------------------------------------------------------
 
-    def is_strategy_disabled(self, strategy_name: str) -> bool:
-        return self._auto_disable.is_disabled(strategy_name)
+    def is_strategy_disabled(
+        self, strategy_name: str, symbol: str | None = None,
+    ) -> bool:
+        return self._auto_disable.is_disabled(strategy_name, symbol)
 
     @property
     def disabled_strategies(self) -> set[str]:
@@ -152,7 +168,7 @@ class RiskManager:
         SignalEvent or None if blocked.
 
         Gate order (first block wins):
-          1.  auto_disable_gate         (strategy on the kill list?)
+          1.  auto_disable_gate         (strategy on kill list, OR (strategy,symbol))
           2.  drawdown_throttle_gate    (hard halt at 20% DD)
           3.  daily_loss_gate           (legacy 5% / day, kept as belt+suspenders)
           4.  session_open_gate         (avoid funding-fix windows)
@@ -160,6 +176,7 @@ class RiskManager:
           5b. chop_gate                 (NEW-6 anti-chop, trend strategies only)
           5c. cg_headwind_gate          (block when CoinGlass liq-imb opposes
                                          trade direction by >= 0.20)
+          5d. post_impulse_gate         (block when |30m move| > 1.5%, trend only)
           6.  bayesian_regime_gate      (data-driven regime block)
           7.  funding_expectancy_gate   (cost > 50% of expected edge?)
           8.  funding_gate              (legacy hard funding cap)
@@ -181,11 +198,13 @@ class RiskManager:
             self._daily_loss_halted = False
             self._halt_date = None
 
-        # Gate 1 — strategy auto-disable
+        # Gate 1 — strategy auto-disable (strategy-wide OR per-symbol)
         head_strategy = (
             approved.strategy_combo[0] if approved.strategy_combo else ""
         )
-        if head_strategy and self._auto_disable.is_disabled(head_strategy):
+        if head_strategy and self._auto_disable.is_disabled(
+            head_strategy, approved.symbol,
+        ):
             self._record_blocked(signal, "auto_disabled")
             return None
 
@@ -231,6 +250,13 @@ class RiskManager:
         # (trend-strategies only; fail-open when cg_liq_imb missing)
         if self._cg_headwind_gate(approved):
             self._record_blocked(signal, "cg_headwind_gate")
+            return None
+
+        # Gate 5d — Post-impulse cooldown.  Block trend-strategy entries
+        # that fire inside a >1.5% 30-min impulse (the "buy the top of
+        # the candle" pattern that drove most of the April Sniper bleed).
+        if self._post_impulse_gate(approved):
+            self._record_blocked(signal, "post_impulse")
             return None
 
         # Gate 6 — Bayesian regime filter
@@ -421,6 +447,33 @@ class RiskManager:
         if signal.direction == "short" and imb >= threshold:
             return True
         return False
+
+    def _post_impulse_gate(self, signal: SignalEvent) -> bool:
+        """Block trend-strategy entries fired inside a sharp recent move.
+
+        Reads ``move_pct_30m`` from the indicator-snapshot ``extras``
+        dict (populated by ``compute_derived`` + ``pack_indicator_extras``).
+        Symmetric: blocks BOTH directions because the live forensics
+        showed long-after-pump and short-after-pump are both losers.
+        Fail-open when the field is missing so a transient indicator
+        glitch never silently halts the bot.
+        """
+        head = (signal.strategy_combo or [""])[0]
+        if head not in self.POST_IMPULSE_GATE_STRATEGIES:
+            return False
+
+        snap = signal.indicators_snapshot or {}
+        extras = snap.get("extras") or {}
+        m30_raw = extras.get("move_pct_30m")
+        if m30_raw is None:
+            return False
+        try:
+            m30 = float(m30_raw)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(m30):
+            return False
+        return abs(m30) > self.POST_IMPULSE_BLOCK_PCT
 
     def _max_positions_gate(
         self, symbol: str, open_positions: list[dict],

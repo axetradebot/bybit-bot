@@ -32,7 +32,7 @@ try:
 except ModuleNotFoundError:
     import pandas_ta_classic as ta  # noqa: F401 — drop-in fork
 import structlog
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text as sa_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 project_root = Path(__file__).resolve().parents[2]
@@ -151,6 +151,11 @@ class WebSocketListener:
         self._predicted_funding: dict[str, float] = {}
         self._latest_mark: dict[str, float] = {}
         self._latest_15m: dict[str, pd.Series] = {}
+        # Per-symbol cache of the most-recent CoinGlass 4h bar so the
+        # cg_headwind_gate stops fail-opening on every live signal.
+        # Refreshed at most every CG_REFRESH_S; (long_usd, short_usd, imb).
+        self._cg_cache: dict[str, tuple[float, float, float, float]] = {}
+        self._cg_refresh_s: float = 300.0  # 5 min
 
         wanted = settings.live_strategy.lower()
         wanted_set = (
@@ -648,6 +653,74 @@ class WebSocketListener:
 
     # ----- indicator computation ----------------------------------------
 
+    def _get_latest_coinglass(
+        self, symbol: str,
+    ) -> tuple[float, float, float] | None:
+        """Return (long_usd, short_usd, imb) from coinglass_liquidation_bars.
+
+        Cached for ``self._cg_refresh_s`` per symbol so we don't query
+        the DB on every closed bar.  Returns None when no data is
+        available -- caller should leave the columns NaN in that case
+        so ``pack_indicator_extras`` skips the cg_* keys (and the gate
+        fail-opens, same as before this fix).
+        """
+        now = time.time()
+        cached = self._cg_cache.get(symbol)
+        if cached and now - cached[0] < self._cg_refresh_s:
+            return cached[1], cached[2], cached[3]
+
+        try:
+            iv = settings.coinglass_min_liquidation_interval
+        except Exception:
+            iv = "4h"
+        try:
+            with self._engine.connect() as conn:
+                row = conn.execute(
+                    sa_text(
+                        """
+                        SELECT long_liquidation_usd,
+                               short_liquidation_usd
+                        FROM coinglass_liquidation_bars
+                        WHERE symbol = :symbol AND interval = :iv
+                        ORDER BY bucket_time DESC
+                        LIMIT 1
+                        """,
+                    ),
+                    {"symbol": symbol, "iv": iv},
+                ).first()
+        except Exception as exc:
+            log.debug("cg_lookup_failed",
+                      symbol=symbol, error=str(exc))
+            return None
+
+        if row is None:
+            return None
+        try:
+            long_usd = float(row[0] or 0.0)
+            short_usd = float(row[1] or 0.0)
+        except (TypeError, ValueError):
+            return None
+        total = long_usd + short_usd
+        imb = (short_usd - long_usd) / (total + 1e-9)
+        self._cg_cache[symbol] = (now, long_usd, short_usd, imb)
+        return long_usd, short_usd, imb
+
+    def _stamp_coinglass_columns(
+        self, symbol: str, row: pd.Series,
+    ) -> None:
+        """Set the three coinglass columns on a row so ``pack_indicator_extras``
+        will lift them into ``extras`` (which the cg_headwind_gate reads).
+        Pre-fix, the live listener never wrote these and the gate
+        fail-opened on 100% of trades.
+        """
+        cg = self._get_latest_coinglass(symbol)
+        if cg is None:
+            return
+        long_usd, short_usd, imb = cg
+        row["coinglass_long_liq_usd"] = long_usd
+        row["coinglass_short_liq_usd"] = short_usd
+        row["coinglass_liq_imb"] = imb
+
     def _compute_indicators(
         self, symbol: str,
     ) -> tuple[pd.Series | None, pd.Series | None,
@@ -674,6 +747,7 @@ class WebSocketListener:
         raw_5m["funding_8h"] = funding
         raw_5m["funding_24h_cum"] = funding * 3
         raw_5m["liq_volume_1h"] = 0.0
+        self._stamp_coinglass_columns(symbol, raw_5m)
         raw_5m["extras"] = pack_indicator_extras(raw_5m)
 
         _rn = {ta: db for ta, db in TA_COL_MAP.items() if ta in raw_5m.index}
@@ -689,6 +763,7 @@ class WebSocketListener:
                 df_15m_ta = detect_rsi_divergence(df_15m_ta)
                 df_15m_ta = detect_momentum_divergence(df_15m_ta)
                 raw_15m = df_15m_ta.iloc[-1].copy()
+                self._stamp_coinglass_columns(symbol, raw_15m)
                 raw_15m["extras"] = pack_indicator_extras(raw_15m)
                 _rn15 = {ta: db for ta, db in TA_COL_MAP.items()
                          if ta in raw_15m.index}
@@ -855,7 +930,8 @@ class WebSocketListener:
 
             last["funding_8h"] = self._latest_funding.get(symbol, 0.0)
             last["liq_volume_1h"] = 0.0
-            last["extras"] = {}
+            self._stamp_coinglass_columns(symbol, last)
+            last["extras"] = pack_indicator_extras(last)
 
             _rn = {ta: db for ta, db in TA_COL_MAP.items()
                    if ta in last.index}

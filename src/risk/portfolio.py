@@ -540,16 +540,29 @@ class BayesianRegimeFilter:
 
 class StrategyAutoDisable:
     """
-    Maintains an in-memory blocklist of strategy names that have shown
-    persistently negative expectancy in the last 30 days.
+    Maintains an in-memory blocklist at TWO levels:
 
-    A strategy is *disabled* when:
-        n_30d >= 30  AND  shrunk_expectancy_pct <= -0.001
-    A disabled strategy is *re-enabled* when:
-        n_7d  >= 10  AND  expectancy_pct_7d >= 0.0005
+      * strategy-wide  -- key = strategy name
+      * per-symbol     -- key = (strategy, symbol)
 
-    Refreshed hourly.  Entirely independent of the per-signal gate, so
-    a disabled strategy's signals never even reach the risk manager.
+    The per-symbol track exists because of the Apr-2026 Sniper
+    post-mortem: PEPE and OP alone were 65% of total losses while the
+    strategy had positive expectancy on SOL/AVAX/XRP.  The
+    strategy-wide disable would not have fired in time; the per-symbol
+    one would have killed PEPE+OP after ~10 trades each.
+
+    Disable thresholds (per-symbol intentionally *more sensitive*
+    because each symbol has fewer trades and a single bad symbol
+    bleeds the portfolio while the strategy looks fine in aggregate):
+
+      strategy-wide   n_30d >= 30 AND shrunk_exp_pct <= -0.001
+      per-symbol      n_30d >= 12 AND shrunk_exp_pct <= -0.0015
+
+    Re-enable (either level):
+      n_7d >= 10 (strat) / >= 6 (symbol) AND exp_pct_7d >= 0.0005
+
+    Refreshed hourly.  ``is_disabled(strategy, symbol=None)`` returns
+    True if EITHER level fires.
     """
 
     REFRESH_S = 3600
@@ -558,9 +571,14 @@ class StrategyAutoDisable:
     REENABLE_N_FLOOR = 10
     REENABLE_EXP_THRESHOLD = 0.0005
 
+    PER_SYMBOL_DISABLE_N_FLOOR = 12
+    PER_SYMBOL_DISABLE_EXP_THRESHOLD = -0.0015
+    PER_SYMBOL_REENABLE_N_FLOOR = 6
+
     def __init__(self, engine: Any | None = None):
         self._engine = engine
         self._disabled: set[str] = set()
+        self._disabled_pairs: set[tuple[str, str]] = set()
         self._last_refresh: float = 0.0
 
     def _refresh(self) -> None:
@@ -598,11 +616,42 @@ class StrategyAutoDisable:
                         """,
                     ),
                 ).fetchall()
+                rows30_pair = conn.execute(
+                    sa_text(
+                        """
+                        SELECT strategy_combo[1] AS strat,
+                               symbol,
+                               COUNT(*)          AS n,
+                               AVG(pnl_pct)      AS exp_pct
+                        FROM trades_log
+                        WHERE win_loss IS NOT NULL
+                          AND is_backtest = FALSE
+                          AND entry_time > NOW() - INTERVAL '30 days'
+                        GROUP BY strategy_combo[1], symbol
+                        """,
+                    ),
+                ).fetchall()
+                rows7_pair = conn.execute(
+                    sa_text(
+                        """
+                        SELECT strategy_combo[1] AS strat,
+                               symbol,
+                               COUNT(*)          AS n,
+                               AVG(pnl_pct)      AS exp_pct
+                        FROM trades_log
+                        WHERE win_loss IS NOT NULL
+                          AND is_backtest = FALSE
+                          AND entry_time > NOW() - INTERVAL '7 days'
+                        GROUP BY strategy_combo[1], symbol
+                        """,
+                    ),
+                ).fetchall()
         except Exception as exc:
             log.warning("auto_disable_refresh_failed", error=str(exc))
             self._last_refresh = time.time()
             return
 
+        # ── strategy-wide ──────────────────────────────────────
         new_disabled: set[str] = set(self._disabled)
         recent_by_strat = {
             str(r[0]): (int(r[1] or 0), float(r[2] or 0.0)) for r in rows7
@@ -610,7 +659,6 @@ class StrategyAutoDisable:
         for r in rows30:
             strat = str(r[0])
             n, exp = int(r[1] or 0), float(r[2] or 0.0)
-            # Shrink expectancy toward zero with prior n=20
             shrunk = exp * (n / (n + 20.0))
             if (strat not in new_disabled
                     and n >= self.DISABLE_N_FLOOR
@@ -619,7 +667,6 @@ class StrategyAutoDisable:
                 log.warning("strategy_auto_disabled",
                             strategy=strat, n=n,
                             shrunk_expectancy_pct=round(shrunk, 5))
-        # Re-enable check
         for strat in list(new_disabled):
             n7, exp7 = recent_by_strat.get(strat, (0, 0.0))
             if (n7 >= self.REENABLE_N_FLOOR
@@ -629,17 +676,56 @@ class StrategyAutoDisable:
                          strategy=strat, n_7d=n7,
                          exp_pct_7d=round(exp7, 5))
 
+        # ── per-symbol ────────────────────────────────────────
+        new_pairs: set[tuple[str, str]] = set(self._disabled_pairs)
+        recent_by_pair = {
+            (str(r[0]), str(r[1])): (int(r[2] or 0), float(r[3] or 0.0))
+            for r in rows7_pair
+        }
+        for r in rows30_pair:
+            strat, symbol = str(r[0]), str(r[1])
+            n, exp = int(r[2] or 0), float(r[3] or 0.0)
+            shrunk = exp * (n / (n + 10.0))
+            key = (strat, symbol)
+            if (key not in new_pairs
+                    and n >= self.PER_SYMBOL_DISABLE_N_FLOOR
+                    and shrunk <= self.PER_SYMBOL_DISABLE_EXP_THRESHOLD):
+                new_pairs.add(key)
+                log.warning("strategy_symbol_auto_disabled",
+                            strategy=strat, symbol=symbol, n=n,
+                            shrunk_expectancy_pct=round(shrunk, 5))
+        for key in list(new_pairs):
+            n7, exp7 = recent_by_pair.get(key, (0, 0.0))
+            if (n7 >= self.PER_SYMBOL_REENABLE_N_FLOOR
+                    and exp7 >= self.REENABLE_EXP_THRESHOLD):
+                new_pairs.discard(key)
+                log.info("strategy_symbol_auto_reenabled",
+                         strategy=key[0], symbol=key[1],
+                         n_7d=n7, exp_pct_7d=round(exp7, 5))
+
         self._disabled = new_disabled
+        self._disabled_pairs = new_pairs
         self._last_refresh = time.time()
 
-    def is_disabled(self, strategy_name: str) -> bool:
+    def is_disabled(
+        self, strategy_name: str, symbol: str | None = None,
+    ) -> bool:
         self._refresh()
-        return strategy_name in self._disabled
+        if strategy_name in self._disabled:
+            return True
+        if symbol is not None and (strategy_name, symbol) in self._disabled_pairs:
+            return True
+        return False
 
     @property
     def disabled(self) -> set[str]:
         self._refresh()
         return set(self._disabled)
+
+    @property
+    def disabled_pairs(self) -> set[tuple[str, str]]:
+        self._refresh()
+        return set(self._disabled_pairs)
 
 
 # ---------------------------------------------------------------------------

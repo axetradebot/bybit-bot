@@ -530,7 +530,15 @@ class OrderManager:
                             symbol=symbol, error=str(exc))
 
     def update_stop_loss(self, symbol: str, new_sl: float) -> bool:
-        """Move the stop-loss for an open position on Bybit."""
+        """Move the stop-loss for an open position on Bybit.
+
+        Also persists ``new_sl`` onto the open trade row in
+        ``trades_log`` so the exit-reason classifier in
+        ``_update_exit_from_fill`` can compare exit_price to the
+        *current* (possibly trailed) stop-loss, not the original one.
+        Without this, every trailed-SL hit was tagged 'fill' instead of
+        'trailing_stop'.
+        """
         if self._exchange is None:
             return False
         ccxt_sym = _to_ccxt_symbol(symbol)
@@ -541,6 +549,7 @@ class OrderManager:
             )
         except Exception:
             new_sl_str = str(new_sl)
+        ok = False
         try:
             self._exchange.set_trading_stop(ccxt_sym, params={
                 "stopLoss": new_sl_str,
@@ -549,23 +558,57 @@ class OrderManager:
             })
             log.info("stop_loss_updated", symbol=symbol,
                      new_sl=new_sl_str, trigger=trigger)
-            return True
+            ok = True
         except AttributeError:
-            pass
-        try:
-            self._exchange.private_post_v5_position_trading_stop({
-                "category": "linear",
-                "symbol": symbol,
-                "stopLoss": new_sl_str,
-                "slTriggerBy": trigger,
-                "positionIdx": 0,
-            })
-            log.info("stop_loss_updated", symbol=symbol,
-                     new_sl=new_sl_str, trigger=trigger)
-            return True
+            try:
+                self._exchange.private_post_v5_position_trading_stop({
+                    "category": "linear",
+                    "symbol": symbol,
+                    "stopLoss": new_sl_str,
+                    "slTriggerBy": trigger,
+                    "positionIdx": 0,
+                })
+                log.info("stop_loss_updated", symbol=symbol,
+                         new_sl=new_sl_str, trigger=trigger)
+                ok = True
+            except Exception as exc:
+                log.error("update_sl_failed", symbol=symbol, error=str(exc))
         except Exception as exc:
             log.error("update_sl_failed", symbol=symbol, error=str(exc))
-            return False
+
+        if ok:
+            tracked = self._open_orders.get(symbol)
+            if tracked:
+                tracked["stop_loss"] = float(new_sl)
+            try:
+                self._persist_open_sl(symbol, float(new_sl))
+            except Exception as exc:
+                log.warning("persist_sl_failed",
+                            symbol=symbol, error=str(exc))
+        return ok
+
+    def _persist_open_sl(self, symbol: str, new_sl: float) -> None:
+        """Update the still-open trade row's stop_loss column.
+
+        Lets ``_update_exit_from_fill`` classify trailed-SL exits
+        correctly, which we couldn't do before because the DB only had
+        the original SL.
+        """
+        with Session(self._engine) as sess:
+            trade = (
+                sess.query(TradesLog)
+                .filter(
+                    TradesLog.symbol == symbol,
+                    TradesLog.is_backtest.is_(False),
+                    TradesLog.exit_time.is_(None),
+                )
+                .order_by(TradesLog.entry_time.desc())
+                .first()
+            )
+            if trade is None:
+                return
+            trade.stop_loss = new_sl
+            sess.commit()
 
     def rebase_protective_orders_from_fill(
         self, signal: SignalEvent, fill_price: float, filled_qty: float,
@@ -788,6 +831,97 @@ class OrderManager:
         )
         self._update_exit_from_fill(symbol, exit_price, reason)
 
+    # Tolerance for matching exit_price to SL/TP (0.15%); trailed-SL
+    # values are persisted via _persist_open_sl so the comparison is
+    # against the *current* SL, not the original.
+    _EXIT_MATCH_TOL = 0.0015
+
+    @classmethod
+    def _classify_exit(
+        cls,
+        direction: str,
+        entry: float,
+        exit_price: float,
+        stop_loss: float | None,
+        take_profit: float | None,
+        passed_reason: str,
+    ) -> str:
+        """Tag an exit with its true reason.
+
+        Priority:
+          * caller-provided reason that ISN'T 'fill' wins (zombie_timeout,
+            manual_close, ...)
+          * else compare exit_price to the trade's current SL / TP
+            within ``_EXIT_MATCH_TOL`` and tag stop_loss / take_profit
+          * else infer from PnL sign:
+              pnl > 0  -> 'trailing_stop'   (BE/trail moved SL above entry)
+              pnl <= 0 -> 'breakeven'       (BE was hit at or near entry)
+        """
+        if passed_reason and passed_reason != "fill":
+            return passed_reason
+        if entry <= 0 or exit_price <= 0:
+            return passed_reason or "fill"
+
+        tol = cls._EXIT_MATCH_TOL
+
+        def _match(level: float | None) -> bool:
+            if level is None or level <= 0:
+                return False
+            return abs(exit_price - float(level)) / float(level) <= tol
+
+        if _match(stop_loss):
+            if stop_loss is not None and (
+                (direction == "long" and stop_loss >= entry)
+                or (direction == "short" and stop_loss <= entry)
+            ):
+                return "trailing_stop"
+            return "stop_loss"
+        if _match(take_profit):
+            return "take_profit"
+
+        if direction == "long":
+            pnl_pct = (exit_price - entry) / entry
+        else:
+            pnl_pct = (entry - exit_price) / entry
+        if pnl_pct > 0:
+            return "trailing_stop"
+        if abs(pnl_pct) < 0.001:
+            return "breakeven"
+        return passed_reason or "fill"
+
+    def _fetch_closed_pnl_funding(
+        self, symbol: str,
+    ) -> tuple[float | None, float | None]:
+        """Pull (closed_pnl_usd, funding_paid_usd) for the most recent
+        closed position on ``symbol`` from Bybit V5.
+
+        Returns (None, None) on any failure -- the bot must never crash
+        because of post-trade reporting issues.  ``funding_paid_usd`` is
+        signed: positive == we paid, negative == we received.
+        """
+        if self._exchange is None:
+            return None, None
+        try:
+            resp = self._exchange.private_get_v5_position_closed_pnl({
+                "category": "linear",
+                "symbol":   symbol,
+                "limit":    1,
+            })
+            items = (
+                (resp or {}).get("result", {}).get("list", [])
+            )
+            if not items:
+                return None, None
+            row = items[0]
+            closed_pnl = float(row.get("closedPnl") or 0)
+            cum_fee = float(row.get("cumFundingFee") or 0)
+            funding_paid = -cum_fee if cum_fee else 0.0
+            return closed_pnl, funding_paid
+        except Exception as exc:
+            log.warning("closed_pnl_fetch_failed",
+                        symbol=symbol, error=str(exc))
+            return None, None
+
     def _update_exit_from_fill(
         self, symbol: str, exit_price: float, reason: str = "fill",
     ) -> None:
@@ -812,15 +946,38 @@ class OrderManager:
                 else:
                     pnl_pct = (entry - exit_price) / entry if entry else 0
 
+                tagged = self._classify_exit(
+                    direction=str(trade.direction),
+                    entry=entry,
+                    exit_price=exit_price,
+                    stop_loss=float(trade.stop_loss) if trade.stop_loss else None,
+                    take_profit=float(trade.take_profit) if trade.take_profit else None,
+                    passed_reason=reason,
+                )
+
                 trade.exit_time = datetime.now(timezone.utc)
                 trade.exit_price = exit_price
-                trade.exit_reason = reason
+                trade.exit_reason = tagged
                 trade.pnl_pct = pnl_pct
                 trade.pnl_usd = float(trade.position_size_usd or 0) * pnl_pct
                 trade.win_loss = pnl_pct > 0
 
+                closed_pnl_usd, funding_paid = self._fetch_closed_pnl_funding(symbol)
+                if funding_paid is not None:
+                    trade.funding_paid_usd = funding_paid
+
                 sess.commit()
                 log.info("trade_exit_logged",
-                         symbol=symbol, pnl_pct=f"{pnl_pct:+.4%}")
+                         symbol=symbol,
+                         pnl_pct=f"{pnl_pct:+.4%}",
+                         reason=tagged,
+                         funding_paid_usd=(
+                             round(funding_paid, 4)
+                             if funding_paid is not None else None
+                         ),
+                         exchange_closed_pnl=(
+                             round(closed_pnl_usd, 4)
+                             if closed_pnl_usd is not None else None
+                         ))
         except Exception as exc:
             log.error("log_exit_failed", error=str(exc))

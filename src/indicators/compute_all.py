@@ -84,6 +84,14 @@ DERIVED_FLOAT_COLS = [
     "candle_body_ratio", "volume_ratio", "vwma_20", "obv_slope",
 ]
 
+# Apr-2026 Sniper post-mortem (76 live trades): 75% of longs and 67% of
+# shorts were opened after a >1.5% impulse over the previous 30 min, and
+# both buckets bled hard (-$80 and -$84 respectively).  We surface the
+# 30m return as a derived field so RiskManager._post_impulse_gate can
+# block "chase the candle" entries irrespective of the EMA-21
+# rejection trigger that fires inside every thrust.
+DERIVED_EXTRAS_FLOAT_COLS = ("move_pct_30m",)
+
 DIV_COLS = [
     "div_regular_bull", "div_regular_bear",
     "div_hidden_bull", "div_hidden_bear",
@@ -323,6 +331,12 @@ def compute_derived(df: pd.DataFrame) -> pd.DataFrame:
     obv = _col(df, "OBV")
     df["obv_slope"] = obv - obv.shift(5)
 
+    close = df["close"].astype(float)
+    prev_close_30m = close.shift(6)
+    df["move_pct_30m"] = (
+        (close - prev_close_30m) / prev_close_30m.replace(0, np.nan)
+    )
+
     return df
 
 
@@ -425,6 +439,16 @@ def pack_indicator_extras(row: pd.Series) -> dict:
                     extras[key] = float(v)
             except (TypeError, ValueError):
                 pass
+    for col in DERIVED_EXTRAS_FLOAT_COLS:
+        v = row.get(col)
+        if v is None:
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if not np.isnan(f):
+            extras[col] = f
     return extras
 
 
