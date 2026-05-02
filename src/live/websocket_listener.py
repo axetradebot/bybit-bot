@@ -196,6 +196,10 @@ class WebSocketListener:
 
         self.risk_manager = RiskManager(
             is_backtest=False, risk_pct=settings.live_risk_pct,
+            # Bumped 3 -> 5 when symbol set grew from 6 -> 10 (2026-05-02).
+            # Total risk per-trade * concurrent = 0.25% * 5 = 1.25%, well below
+            # the 2.5% safety ceiling and 0.5% legacy validated point.
+            max_concurrent_positions=5,
         )
         self.order_manager = OrderManager(engine)
         self._equity = self._fetch_live_equity() or settings.live_equity
