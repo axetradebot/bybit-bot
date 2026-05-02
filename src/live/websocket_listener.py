@@ -796,11 +796,30 @@ class WebSocketListener:
         self._db_backoff_seconds = 30.0
 
     def _db_record_failure(self, error: str) -> None:
-        """Open the breaker with exponential back-off (capped)."""
-        self._db_unavailable_until = time.time() + self._db_backoff_seconds
-        log.warning("db_writes_paused",
-                    cooldown_s=self._db_backoff_seconds,
-                    error=error[:200])
+        """Open the breaker with exponential back-off (capped).
+
+        Identical repeat errors are demoted to ``debug`` for up to 1h to
+        keep operational logs clean when a known harmless schema gap
+        (e.g. a not-yet-migrated indicator column) keeps tripping the
+        breaker on every bar.  New error strings, or the same error
+        after a 1h quiet period, still log at ``warning`` so genuine DB
+        issues remain visible.
+        """
+        now = time.time()
+        self._db_unavailable_until = now + self._db_backoff_seconds
+        err_short = error[:200]
+        last_err = getattr(self, "_db_last_logged_err", None)
+        last_ts = getattr(self, "_db_last_logged_err_ts", 0.0)
+        if err_short == last_err and (now - last_ts) < 3600:
+            log.debug("db_writes_paused_repeat",
+                      cooldown_s=self._db_backoff_seconds,
+                      error=err_short)
+        else:
+            log.warning("db_writes_paused",
+                        cooldown_s=self._db_backoff_seconds,
+                        error=err_short)
+            self._db_last_logged_err = err_short
+            self._db_last_logged_err_ts = now
         self._db_backoff_seconds = min(
             self._db_backoff_seconds * 2.0, self._db_backoff_max,
         )
