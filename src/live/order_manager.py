@@ -378,9 +378,35 @@ class OrderManager:
                 fetched = order
             status = (fetched.get("status") or "").lower()
             filled = float(fetched.get("filled") or 0)
-            if filled > 0:
-                return fetched
             if status in ("closed", "filled"):
+                # Fully complete (filled or rejected).
+                return fetched
+            if filled > 0:
+                # PARTIAL fill -- cancel the unfilled remainder before
+                # returning so it doesn't keep filling in the background
+                # while the rest of the pipeline sets up SL / TP for
+                # ``filled`` only.  Without this the position grows past
+                # the protective order sizes (the partial-fill leak that
+                # caused the 2026-05-03 DOGE / phantom-position incidents).
+                try:
+                    self._exchange.cancel_order(order_id, ccxt_sym)
+                    log.info("entry_partial_remainder_cancelled",
+                             symbol=signal.symbol,
+                             order_id=order_id,
+                             filled=filled,
+                             intended=amount)
+                except Exception as exc:
+                    log.warning("entry_partial_cancel_failed",
+                                symbol=signal.symbol,
+                                order_id=order_id,
+                                error=str(exc))
+                # Re-fetch in case a fill landed during the cancel race;
+                # the latest snapshot is what we'll size protective
+                # orders against.
+                try:
+                    fetched = self._exchange.fetch_order(order_id, ccxt_sym)
+                except Exception:
+                    pass
                 return fetched
 
             # Still open and unfilled — cancel and step further out.
@@ -750,6 +776,15 @@ class OrderManager:
         """
         Called by WebSocket listener on execution-stream events.
         Updates trades_log with the actual fill price and computes PnL.
+
+        Partial-close protection:  before recording an exit, query Bybit
+        for the live position size.  If the close fill only reduced the
+        position (rather than fully closing it) we DO NOT mark the trade
+        as exited and DO NOT pop position tracking; instead we re-attach
+        a TP for the residual quantity so it gets closed cleanly later.
+        Without this guard an under-sized TP firing once would orphan
+        the residual position and confuse all downstream bookkeeping
+        (the 2026-05-03 partial-close incident).
         """
         symbol = fill_event.get("symbol", "")
         exec_price = float(fill_event.get("execPrice", 0) or 0)
@@ -771,9 +806,109 @@ class OrderManager:
             or (tracked["direction"] == "short" and side.lower() == "buy")
         )
 
-        if is_closing:
-            self._update_exit_from_fill(symbol, exec_price)
-            self._open_orders.pop(symbol, None)
+        if not is_closing:
+            return
+
+        residual = self._fetch_position_size(symbol)
+        if residual > 0:
+            # Position still open after this close fill.  Re-issue a TP
+            # for the residual at the current take-profit price so it
+            # gets cleared rather than dangling indefinitely.
+            log.warning("partial_close_detected",
+                        symbol=symbol,
+                        closed_qty=exec_qty,
+                        residual_qty=residual,
+                        exec_price=exec_price)
+            try:
+                self._reissue_tp_for_residual(
+                    symbol=symbol,
+                    tracked=tracked,
+                    residual_qty=residual,
+                )
+            except Exception as exc:
+                log.error("reissue_tp_failed",
+                          symbol=symbol, error=str(exc))
+            return
+
+        self._update_exit_from_fill(symbol, exec_price)
+        self._open_orders.pop(symbol, None)
+
+    def _fetch_position_size(self, symbol: str) -> float:
+        """Return Bybit's current position size for ``symbol`` (0 if flat).
+
+        Used by the partial-close guard in ``handle_fill``.  Falls back
+        to 0 on any error so we don't accidentally suppress the exit
+        path when the API is unreachable.
+        """
+        if self._exchange is None:
+            return 0.0
+        try:
+            positions = self._exchange.private_get_v5_position_list({
+                "category": "linear",
+                "symbol": symbol,
+            })
+        except Exception as exc:
+            log.warning("position_size_fetch_failed",
+                        symbol=symbol, error=str(exc))
+            return 0.0
+        for p in positions.get("result", {}).get("list", []):
+            if p.get("symbol") != symbol:
+                continue
+            try:
+                return float(p.get("size") or 0)
+            except (TypeError, ValueError):
+                return 0.0
+        return 0.0
+
+    def _reissue_tp_for_residual(
+        self, *, symbol: str, tracked: dict, residual_qty: float,
+    ) -> None:
+        """Cancel the existing reduce-only TP (if any) and place a new
+        one sized to ``residual_qty`` at the trade's TP price.  Position-
+        level SL is already in place via the trading-stop endpoint and
+        does not need reposting.
+        """
+        if self._exchange is None or residual_qty <= 0:
+            return
+        ccxt_sym = _to_ccxt_symbol(symbol)
+        # Cancel any existing reduce-only LIMIT (the old TP) but leave
+        # the position-level conditional StopLoss order untouched.
+        try:
+            self._exchange.cancel_all_orders(
+                ccxt_sym, params={"orderFilter": "Order"},
+            )
+        except Exception as exc:
+            log.warning("cancel_resting_tp_failed",
+                        symbol=symbol, error=str(exc))
+
+        tp_price = float(tracked.get("take_profit") or 0)
+        if tp_price <= 0:
+            log.warning("no_tp_price_for_residual",
+                        symbol=symbol, residual=residual_qty)
+            return
+
+        close_side = "sell" if tracked.get("direction") == "long" else "buy"
+        qty = self._round_amount(ccxt_sym, residual_qty)
+        if qty <= 0:
+            return
+        try:
+            self._exchange.create_order(
+                symbol=ccxt_sym,
+                type="limit",
+                side=close_side,
+                amount=qty,
+                price=self._round_price(ccxt_sym, tp_price),
+                params={
+                    "timeInForce": "PostOnly",
+                    "reduceOnly": True,
+                },
+            )
+            log.info("tp_residual_replaced",
+                     symbol=symbol, qty=qty, price=tp_price)
+            tracked["amount"] = qty
+        except Exception as exc:
+            log.error("tp_residual_place_failed",
+                      symbol=symbol, qty=qty, error=str(exc))
 
     def get_daily_pnl(self) -> float:
         try:
