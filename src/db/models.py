@@ -167,6 +167,22 @@ class Indicators5m(Base):
     funding_24h_cum: Mapped[float | None] = mapped_column(Numeric(20, 10))
     liq_volume_1h: Mapped[float | None] = mapped_column(Numeric(30, 8))
 
+    # Trend strength / Directional
+    adx_14: Mapped[float | None] = mapped_column(Numeric(10, 4))
+    plus_di: Mapped[float | None] = mapped_column(Numeric(10, 4))
+    minus_di: Mapped[float | None] = mapped_column(Numeric(10, 4))
+
+    # Additional momentum / flow
+    cmf_20: Mapped[float | None] = mapped_column(Numeric(10, 4))
+    willr_14: Mapped[float | None] = mapped_column(Numeric(10, 4))
+    roc_10: Mapped[float | None] = mapped_column(Numeric(10, 4))
+
+    # Candle/volume structure
+    candle_body_ratio: Mapped[float | None] = mapped_column(Numeric(10, 4))
+    volume_ratio: Mapped[float | None] = mapped_column(Numeric(10, 4))
+    vwma_20: Mapped[float | None] = mapped_column(Numeric(20, 8))
+    obv_slope: Mapped[float | None] = mapped_column(Numeric(30, 8))
+
     # Overflow
     extras: Mapped[dict | None] = mapped_column(JSONB)
 
@@ -232,6 +248,22 @@ class Indicators15m(Base):
     funding_8h: Mapped[float | None] = mapped_column(Numeric(20, 10))
     funding_24h_cum: Mapped[float | None] = mapped_column(Numeric(20, 10))
     liq_volume_1h: Mapped[float | None] = mapped_column(Numeric(30, 8))
+
+    # Trend strength / Directional
+    adx_14: Mapped[float | None] = mapped_column(Numeric(10, 4))
+    plus_di: Mapped[float | None] = mapped_column(Numeric(10, 4))
+    minus_di: Mapped[float | None] = mapped_column(Numeric(10, 4))
+
+    # Additional momentum / flow
+    cmf_20: Mapped[float | None] = mapped_column(Numeric(10, 4))
+    willr_14: Mapped[float | None] = mapped_column(Numeric(10, 4))
+    roc_10: Mapped[float | None] = mapped_column(Numeric(10, 4))
+
+    # Candle/volume structure
+    candle_body_ratio: Mapped[float | None] = mapped_column(Numeric(10, 4))
+    volume_ratio: Mapped[float | None] = mapped_column(Numeric(10, 4))
+    vwma_20: Mapped[float | None] = mapped_column(Numeric(20, 8))
+    obv_slope: Mapped[float | None] = mapped_column(Numeric(30, 8))
 
     # Overflow
     extras: Mapped[dict | None] = mapped_column(JSONB)
